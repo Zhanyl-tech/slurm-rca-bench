@@ -1,0 +1,53 @@
+id: S03-controller-rpc-saturation
+title: Everything is slow and the controller is pinned
+family: controller
+difficulty: single_layer
+
+symptom: >-
+  squeue takes 10-30 seconds to return. Job submission is slow. sinfo is slow.
+  The cluster is otherwise running jobs normally.
+
+notes: >-
+  Tests whether an agent distinguishes a saturated controller that is the cause
+  from a saturated controller that is a victim — the S01 confusion, inverted.
+  Here the controller really is the answer, and an agent that has learned to
+  always look further upstream should be penalised for overshooting.
+
+injection: >-
+  A tight loop of squeue/sinfo RPCs from multiple clients saturates slurmctld's
+  RPC threads. Emulates a badly-behaved user script or monitoring agent, which is
+  one of the most common real causes of controller saturation.
+
+observe_s: 180
+
+causal_chain:
+  - node: slurm.slurmctld
+    state: rpc_thread_exhaustion
+    observable_at_s: 0
+    evidence:
+      - "sdiag: Agent queue size and RPC counts far above baseline"
+      - "sdiag: one RPC type dominates the call count"
+      - "slurmctld CPU near saturation"
+
+scoring:
+  - node: slurm.slurmctld
+    credit: 1.0
+    rationale: >-
+      The controller is genuinely the bottleneck, and sdiag names the offending
+      RPC type directly.
+  - node: db.mysql
+    credit: 0.0
+    rationale: >-
+      The database is idle. This is the overshoot answer — an agent that assumes
+      every controller problem is really a storage or DB problem lands here.
+  - node: storage.shared_fs
+    credit: 0.0
+    rationale: Overshoot. Storage is healthy and the telemetry shows it.
+  - node: unknown
+    credit: 0.05
+    rationale: Abstention on a solvable single-hop task earns very little.
+
+distractors:
+  slurm.config: >-
+    Suspecting a MessageTimeout or thread-count misconfiguration is reasonable,
+    but the config is unchanged and the RPC counts show external load.

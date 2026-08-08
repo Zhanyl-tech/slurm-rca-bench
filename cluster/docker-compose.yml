@@ -1,0 +1,119 @@
+# Reduced Slurm control plane for slurm-rca-bench.
+#
+# Derived from giovtorres/slurm-docker-cluster (MIT), pinned at 978c3de /
+# Slurm 25.11.4 — see ../NOTICE and upstream.lock. Reduced to the components
+# the benchmark's dependency chain actually names:
+#
+#   mysql -> slurmdbd -> slurmctld -> cpu-worker
+#
+# Runs under its own Compose project name (slurmrca) so injections can pause a
+# database or kill a node daemon without touching a developer's own cluster.
+
+x-image: &slurm_image
+  image: slurm-docker-cluster:${SLURM_VERSION:-25.11.4}
+
+services:
+  mysql:
+    image: mariadb:12
+    hostname: mysql
+    container_name: slurmrca-mysql
+    environment:
+      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+      MARIADB_DATABASE: slurm_acct_db
+      MARIADB_USER: slurm
+      MARIADB_PASSWORD: password
+    volumes:
+      - var_lib_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  slurmdbd:
+    <<: *slurm_image
+    command: ["slurmdbd"]
+    hostname: slurmdbd
+    container_name: slurmrca-slurmdbd
+    init: true
+    # The upstream entrypoint waits on the DB with `-u$MYSQL_USER -p$MYSQL_PASSWORD`.
+    # Omit these and the shell expands it to user "-p", which fails with a
+    # confusing "Access denied for user '-p'" until the healthcheck gives up.
+    environment:
+      MYSQL_USER: slurm
+      MYSQL_PASSWORD: password
+    volumes:
+      - etc_munge:/etc/munge
+      - etc_slurm:/etc/slurm
+      - var_log_slurm:/var/log/slurm
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep slurmdbd || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  slurmctld:
+    <<: *slurm_image
+    command: ["slurmctld"]
+    hostname: slurmctld
+    container_name: slurmrca-slurmctld
+    init: true
+    volumes:
+      - etc_munge:/etc/munge
+      - etc_slurm:/etc/slurm
+      - slurm_jobdir:/data
+      - var_log_slurm:/var/log/slurm
+    depends_on:
+      slurmdbd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep slurmctld || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  cpu-worker:
+    <<: *slurm_image
+    # `slurmd-cpu`, not `slurmd`: the upstream entrypoint uses this form to
+    # register dynamically (slurmd -Z) with Feature=cpu, which is what the
+    # cpu_nodes NodeSet matches. Plain `slurmd` starts and exits, because the
+    # config defines no static nodes.
+    command: ["slurmd-cpu"]
+    init: true
+    working_dir: /data
+    # slurmd sets its own hostname and manages cgroups.
+    privileged: true
+    environment:
+      # detect_replica_number resolves ${COMPOSE_PROJECT_NAME}-cpu-worker-N to
+      # find its own replica index, which becomes the Slurm node name (c1).
+      # Without this it falls back to the container id and never matches the
+      # cpu_nodes NodeSet.
+      COMPOSE_PROJECT_NAME: slurmrca
+    # Deliberately no container_name: the entrypoint derives the Slurm node
+    # name from the Compose replica number (cpu-worker-1 -> c1), so pinning a
+    # container name breaks node naming.
+    deploy:
+      replicas: 1
+    volumes:
+      - etc_munge:/etc/munge
+      - etc_slurm:/etc/slurm
+      - slurm_jobdir:/data
+      - var_log_slurm:/var/log/slurm
+    depends_on:
+      slurmctld:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep slurmd || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  etc_munge:
+  etc_slurm:
+  slurm_jobdir:
+  var_lib_mysql:
+  var_log_slurm:

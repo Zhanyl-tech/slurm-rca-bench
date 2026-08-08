@@ -1,0 +1,9 @@
+# The exact upstream the benchmark is pinned to.
+#
+# A benchmark that floats on a moving base produces numbers that cannot be
+# compared across time. Bump this deliberately, and treat it as a breaking
+# change to every published result.
+repo   = https://github.com/giovtorres/slurm-docker-cluster.git
+commit = 978c3ded1f72c1855e528a56559a7a51142eb39c
+date   = 2026-05-09
+slurm  = 25.11.4

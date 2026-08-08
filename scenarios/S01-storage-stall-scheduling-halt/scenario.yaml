@@ -1,0 +1,156 @@
+id: S01-storage-stall-scheduling-halt
+title: Accounting goes dark and the controller's queue climbs, with no error anywhere
+family: storage
+difficulty: multi_layer
+
+symptom: >-
+  sacct and sreport have been hanging for the last twenty minutes — they never
+  return, they never error. Jobs are still running and users are not complaining
+  about throughput. Nothing was deployed today. The monitoring dashboard for job
+  history is blank.
+
+notes: >-
+  The flagship scenario. Every component named in the report is healthy; the
+  cause is two layers below the lowest one anyone would think to check, and
+  nothing in the path logs an error at any point.
+
+  The difficulty is the *shape* of the failure, not its depth alone. A broken
+  database returns an error a grep can find. A stalled one returns nothing, so
+  every caller simply waits, and the only positive signal anywhere is a queue
+  depth that grows slowly in sdiag output nobody is watching. An agent that
+  greps for ERROR finds nothing and concludes the cluster is fine.
+
+  IMPORTANT — this scenario was rewritten after measurement. Its first version
+  claimed the stall propagates to a full scheduling halt about thirteen minutes
+  in, with jobs stuck PENDING. That is a widely-believed folk model and it is
+  false: measured on a live cluster, slurmctld keeps scheduling throughout and
+  jobs run to completion the entire time. See the verification block below. The
+  scenario is still multi-layer and the symptom is still four hops from the
+  cause; it just no longer claims a consequence that does not happen.
+
+injection: >-
+  Emulated by suspending the MySQL container's process group (SIGSTOP), which
+  makes every accounting write block on a backend that neither fails nor
+  answers. This reproduces the *shape* of a shared-filesystem stall — unbounded
+  waits rather than errors — without needing a real distributed filesystem. It
+  is an emulation of the storage layer beneath the database, not a real storage
+  fault; see the README limitations.
+
+observe_s: 900
+
+verification:
+  measured: true
+  method: >-
+    Live run against the benchmark's own Compose project (slurmrca) on Slurm
+    25.11.4. mysql paused via `docker pause`; probes every 10-60s for ~16
+    minutes running sacct, sinfo, sdiag, sbatch and squeue from the slurmctld
+    container; healed with `docker unpause` and re-probed.
+  observations:
+    "t+0s": "baseline — sacct ok, sinfo ok, node c1 idle, DBD Agent queue size 0"
+    "t+5s": "sacct BLOCKS (no return, no error); sinfo still returns normally"
+    "t+60s": "sacct still blocked; sdiag reachable; DBD Agent queue size 1"
+    "t+180s": "sdiag DBD Agent queue size reaches 6 on a second run (make smoke)"
+    "t+840s": "sdiag DBD Agent queue size 6 and climbing; sbatch still accepted"
+    "t+900s": "submitted jobs reach the node and run; queue drains to empty"
+    "heal+10s": "sacct returns immediately; queued records flush — jobs 4 and 5 both COMPLETED"
+  caveats: >-
+    Queue growth is driven by accounting traffic, not elapsed time. Two runs
+    reached a depth of 6 at t+180s and t+840s respectively, so observable_at_s
+    below records when the signal is reliably *visible*, not a rate. Any scoring
+    that depends on a precise queue depth at a precise time would be measuring
+    cluster activity rather than the agent.
+
+    The measurement REFUTED the original chain. Jobs 4 and 5 were submitted
+    while the backend was stalled and both completed, with their accounting
+    records queued and flushed on heal, so scheduling never halted. Job start
+    latency did degrade to tens of seconds, which is a real effect and is what
+    the chain now claims. The 780s "scheduling halts" hop has been removed.
+
+    A genuine storage-induced scheduling halt is achievable through
+    StateSaveLocation rather than the accounting path — slurmctld blocks on
+    state writes — and that is the correct mechanism for a future scenario. It
+    is not what this injection does, so this scenario does not claim it.
+
+causal_chain:
+  - node: storage.shared_fs
+    state: slow_ops
+    observable_at_s: 0
+    evidence:
+      - "storage exporter: op latency climbs; operations complete, just slowly"
+      - "no errors logged anywhere — this absence is the diagnostic signal"
+
+  - node: db.mysql
+    state: unresponsive_no_error
+    observable_at_s: 5
+    evidence:
+      - "any client query blocks indefinitely rather than being refused"
+      - "the database process is alive; a liveness probe on the port succeeds"
+
+  - node: slurm.slurmdbd
+    state: waiting_on_db
+    observable_at_s: 60
+    evidence:
+      - "sacct and sreport hang and never return"
+      - "slurmdbd is running and its port accepts connections"
+
+  - node: slurm.slurmctld
+    state: dbd_agent_queue_growing
+    observable_at_s: 840
+    evidence:
+      - "sdiag: 'DBD Agent queue size' climbs monotonically (measured 0 -> 6; rate varies with accounting traffic)"
+      - "scheduling continues; job start latency degrades to tens of seconds"
+      - "slurmctld logs no error for the stalled backend"
+
+scoring:
+  - node: storage.shared_fs
+    credit: 1.0
+    rationale: >-
+      The cause. Everything downstream is a consequence, and restarting anything
+      downstream restores nothing while the layer underneath is still stalled.
+
+  - node: db.mysql
+    credit: 0.45
+    rationale: >-
+      One hop from the cause and defensible under time pressure: the database
+      really is unresponsive. But it is unresponsive because of what is beneath
+      it, and restarting it is the action this partial credit warns about.
+
+  - node: slurm.slurmdbd
+    credit: 0.3
+    rationale: >-
+      Correctly identifies the accounting path as the transmission route, which
+      is real diagnostic progress, but names a victim as the culprit.
+
+  - node: slurm.slurmctld
+    credit: 0.1
+    rationale: >-
+      The controller is where a growing queue is visible, and spotting it is
+      evidence the agent read sdiag rather than just the logs. It is still the
+      furthest-downstream observation, so it earns very little.
+
+  - node: slurm.scheduler
+    credit: 0.0
+    rationale: >-
+      Zero, and specifically because the measurement showed scheduling does not
+      fail here. An agent naming the scheduler is asserting a consequence that
+      does not occur.
+
+  - node: unknown
+    credit: 0.05
+    rationale: >-
+      A small consolation for honest abstention. Deliberately non-zero: an agent
+      that says "I cannot tell" is more useful at 3am than one that confidently
+      restarts the controller. Deliberately tiny: this scenario is solvable from
+      the telemetry provided.
+
+distractors:
+  slurm.config: >-
+    Nothing was deployed, but an agent that cannot find a live cause often
+    retreats to "someone must have changed a limit". The config is unchanged.
+  slurm.slurmd: >-
+    Nodes are idle and healthy, which invites "the nodes must not be
+    registering". They are registering fine and running jobs throughout.
+  network.control_plane: >-
+    Hanging clients look like a network partition, and this is the most
+    defensible wrong answer: the failure genuinely presents as silence. What
+    rules it out is that the ports accept connections and other RPCs return.

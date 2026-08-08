@@ -1,0 +1,58 @@
+id: S04-gpu-ecc-drain
+title: One node keeps failing jobs, others are fine
+family: gpu
+difficulty: single_layer
+
+symptom: >-
+  Jobs assigned to one GPU node fail within minutes with CUDA errors. The same
+  jobs succeed when they land elsewhere. The node shows as IDLE between failures.
+
+notes: >-
+  A single-node hardware fault, deliberately easy to *localise* and harder to
+  *name*: an agent must distinguish uncorrectable ECC since boot (the card is
+  failing now) from lifetime counters (historic, already handled). Getting the
+  node right but the mechanism wrong is scored as partial credit, because in
+  practice that still leads to the correct action of draining the node.
+
+injection: >-
+  The GPU worker's nvidia-smi is replaced with a wrapper emitting a synthetic
+  volatile uncorrectable ECC count and a row-remap failure. The cluster has no
+  real GPUs, so all GPU telemetry in this benchmark is synthetic by construction;
+  see the README limitations.
+
+observe_s: 180
+
+causal_chain:
+  - node: gpu.device
+    state: uncorrectable_ecc_volatile
+    observable_at_s: 0
+    evidence:
+      - "nvidia-smi: volatile uncorrectable ECC errors non-zero on one device"
+      - "row remap: failure state on the same device"
+      - "errors are per-device and confined to a single node"
+
+scoring:
+  - node: gpu.device
+    credit: 1.0
+    rationale: The card is failing and the counters say so unambiguously.
+  - node: gpu.driver
+    credit: 0.35
+    rationale: >-
+      Wrong mechanism, right locality. A driver-level answer still drains the
+      node, which is the correct action, so it earns real partial credit.
+  - node: slurm.slurmd
+    credit: 0.1
+    rationale: >-
+      Identifies the affected node but blames the wrong layer entirely; slurmd
+      is reporting the failure, not causing it.
+  - node: unknown
+    credit: 0.05
+    rationale: Solvable from a single command's output; abstention earns little.
+
+distractors:
+  slurm.config: >-
+    "The partition must be misconfigured" is tempting because the failures look
+    placement-dependent. They are — but because of the hardware on that node.
+  fabric.interconnect: >-
+    Single-node CUDA failures are not a fabric problem, but multi-node job
+    failures are often blamed on the fabric out of habit.

@@ -1,0 +1,62 @@
+id: S02-dbd-lock-contention
+title: sacct hangs but jobs keep running
+family: accounting_db
+difficulty: single_layer
+
+symptom: >-
+  sacct and sreport hang for minutes or time out. Running jobs are unaffected and
+  new jobs still start. Users are complaining they cannot see their history.
+
+notes: >-
+  The control scenario for S01. Same family, same components, but the cause is
+  where the symptom is — one hop, not four. An agent should find this quickly.
+  Its real purpose is comparative: if a configuration scores similarly on S02 and
+  S01, the dependency graph is not what is helping it, because S02 does not need
+  one. Divergence between these two is the cleanest signal the benchmark produces.
+
+injection: >-
+  A long-lived transaction holds a table lock on the job table
+  (SELECT ... FOR UPDATE with no commit), so accounting reads queue behind it
+  while the scheduling path, which does not touch that table synchronously,
+  continues normally.
+
+observe_s: 240
+
+causal_chain:
+  - node: db.mysql
+    state: table_lock_held
+    observable_at_s: 0
+    evidence:
+      - "mysql: INNODB_TRX shows a transaction running for minutes"
+      - "mysql: lock waits on the job table climbing"
+
+  - node: slurm.slurmdbd
+    state: queries_blocked
+    observable_at_s: 30
+    evidence:
+      - "slurmdbd log: query duration warnings"
+      - "sacct client blocks; slurmdbd thread count at limit"
+
+scoring:
+  - node: db.mysql
+    credit: 1.0
+    rationale: The lock is the cause and it is directly visible in the DB.
+  - node: slurm.slurmdbd
+    credit: 0.2
+    rationale: >-
+      The symptom layer. slurmdbd is blocked, but it is blocked *on* something,
+      and stopping at the daemon is stopping one hop short.
+  - node: storage.shared_fs
+    credit: 0.0
+    rationale: >-
+      Zero, not negative, but worth noting: an agent that has learned S01's
+      pattern may reach for storage reflexively. The filesystem is healthy here
+      and the telemetry says so.
+  - node: unknown
+    credit: 0.05
+    rationale: Honest abstention, small credit. This one is clearly solvable.
+
+distractors:
+  slurm.slurmctld: >-
+    The controller is healthy and scheduling normally, but "Slurm is broken"
+    invites naming the controller first.
