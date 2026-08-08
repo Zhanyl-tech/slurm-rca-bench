@@ -11,16 +11,25 @@ existing root-cause-analysis benchmark for LLM agents is cloud microservices.
 
 ## The thesis
 
-Published RCA scores for LLM agents are poor, and consistently so:
+Published RCA scores for LLM agents are poor — but they are improving fast with
+model generation, and quoting a stale number would misrepresent both facts.
+Dated and attributed:
 
-| Benchmark | Best reported result | Scale |
-|---|---|---|
-| [ORCA-bench](https://arxiv.org/abs/2607.28545) | **48.8%** RCA depth (GPT-5.5) | 884 incident tasks |
-| [OpenRCA](https://github.com/microsoft/OpenRCA) (ICLR'25) | **11.34%** accuracy (Claude 3.5 + RCA-agent) | 335 failures, 68 GB telemetry |
+| Benchmark | Model | Result | When |
+|---|---|---|---|
+| [OpenRCA](https://github.com/microsoft/OpenRCA) (335 failures) | Claude 3.5 + RCA-agent | 11.34% | ICLR'25 |
+| OpenRCA | Claude Opus 4.5 | 90/335 = **27%** | [Opus 4.6 system card](https://www.anthropic.com/news/claude-opus-4-6) |
+| OpenRCA | Claude Opus 4.6 | 117/335 = **35%** | Feb 2026 |
+| [ORCA-bench](https://arxiv.org/abs/2607.28545) (884 incident tasks) | Claude Sonnet 4.6 | 30.6% strict RCA accuracy | Jul 2026 |
+| ORCA-bench | GPT-5.5 | **48.8%** RCA depth (partial credit) | Jul 2026 |
 
-On ORCA-bench, the stricter *RCA accuracy* metric — naming every root cause
-correctly — tops out at 30.6%. These are strong models on carefully-built
-benchmarks, so the shortfall is not a prompting problem.
+**Read the trend, not the floor.** OpenRCA went 11% → 27% → 35% across three
+Claude generations on an unchanged task set. Anyone citing "LLM agents get 11%
+at RCA" in 2026 is quoting a model two generations old.
+
+Even so, the best current numbers mean **roughly two thirds of incidents are
+still misdiagnosed** — 35% strict on OpenRCA, 48.8% with partial credit on
+ORCA-bench. That is nowhere near dependable for an on-call rotation.
 
 **The structural reason is the graph.** Cloud dependency graphs are huge,
 dynamic, and undocumented; a microservice mesh changes shape between deploys and
@@ -36,14 +45,15 @@ shared filesystem → accounting DB → slurmdbd → slurmctld → scheduling
 is small, static, documented, and *the same at every Slurm site on earth*. It
 does not change between deploys. It has maybe a dozen components.
 
-> **Hypothesis:** most of the accuracy general agents lose on RCA is lost to
-> graph inference, not to reasoning. Write the dependency graph down and much of
-> it comes back.
+> **Hypothesis:** a meaningful share of what general agents lose on RCA is lost
+> to graph inference, not reasoning. Write the graph down and some of it returns.
 
-This repo is the benchmark that tests that claim. The agent measured against it
-lives in [cluster-sre-agent](https://github.com/Zhanyl-tech/cluster-sre-agent),
-built as five ablatable configurations so the graph's contribution can be
-isolated rather than asserted.
+**The generational trend is the control that makes this worth testing.** If
+scores climb this fast on raw capability alone, then "does an explicit graph
+help *beyond* scaling?" is exactly the question that needs an ablation rather
+than an opinion — which is what
+[cluster-sre-agent](https://github.com/Zhanyl-tech/cluster-sre-agent) is, five
+configurations differing by one variable at a time.
 
 **A negative result is a result.** If configuration C — the one with the graph —
 does not beat configuration B, that is the finding and it gets published as the
