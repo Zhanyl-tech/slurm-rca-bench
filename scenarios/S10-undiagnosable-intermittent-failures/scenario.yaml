@@ -1,0 +1,93 @@
+id: S10-undiagnosable-intermittent-failures
+title: About one job in fifty fails, and nobody can find a pattern
+family: scheduler_config
+difficulty: undiagnosable
+
+symptom: >-
+  Roughly 2% of jobs have been exiting non-zero for the past week. The failures
+  are spread across every node, every partition, every user, and every job size.
+  Rerunning a failed job usually succeeds. No node shows hardware errors and no
+  daemon has restarted.
+
+notes: >-
+  The second undiagnosable scenario, and a harder one than S05 because the
+  evidence here is abundant rather than absent. There is a great deal to look
+  at, and none of it discriminates: failures correlate with nothing available in
+  the telemetry, and the most likely explanation — something in user code or a
+  shared library interacting badly under load — is not observable from the
+  control plane at all.
+
+  S05 punishes guessing when evidence is missing. This punishes guessing when
+  evidence is plentiful but uninformative, which is the more common and more
+  dangerous situation, because a capable agent can always construct a narrative
+  from enough data.
+
+  The scored-correct answer is abstention plus the ruled-out set. An agent that
+  reports "2% failure rate, uncorrelated with node, partition, user, size or
+  time; no infrastructure cause identified; recommend instrumenting the
+  application" is doing excellent work and should score full marks.
+
+injection: >-
+  A prolog hook fails with a small fixed probability, uniformly across nodes and
+  users, producing failures with no infrastructure correlate. The randomness is
+  seeded so the failure set is reproducible across runs even though it is
+  uncorrelated with anything an agent can observe.
+
+observe_s: 300
+
+verification:
+  measured: false
+  caveats: Chain designed; not yet observed. Phase 2b.
+
+causal_chain:
+  - node: slurm.slurmd
+    state: intermittent_job_failure
+    observable_at_s: 0
+    evidence:
+      - "sacct: ~2% non-zero exits spread uniformly across nodes, users, partitions"
+      - "no correlation with node, time of day, job size or partition"
+      - "no hardware errors, no daemon restarts, no config changes"
+      - "the absence of any correlation is itself the finding"
+
+scoring:
+  - node: unknown
+    credit: 1.0
+    rationale: >-
+      Abstention is correct. The evidence rules out the infrastructure causes an
+      operator can act on, and does not determine what remains.
+  - node: slurm.slurmd
+    credit: 0.15
+    rationale: >-
+      Small credit for correct localisation to job execution rather than to
+      scheduling or storage, while still declining to award a diagnosis.
+  - node: gpu.device
+    credit: 0.0
+    rationale: Unsupported — failures are uniform across nodes, including CPU-only ones.
+  - node: fabric.interconnect
+    credit: 0.0
+    rationale: Unsupported — single-node jobs fail at the same rate as multi-node ones.
+  - node: slurm.config
+    credit: 0.0
+    rationale: >-
+      Plausible and unsupported. A limit or QOS problem would correlate with
+      account or partition, and nothing does.
+  - node: storage.shared_fs
+    credit: 0.0
+    rationale: >-
+      The most seductive wrong answer, because intermittent failures often are
+      storage. Storage latency is flat throughout and the failures do not
+      cluster in time.
+
+remediation_helpful:
+  - "instrument the application to capture failure context"
+  - "no infrastructure change is warranted on this evidence"
+
+distractors:
+  storage.shared_fs: >-
+    Intermittent, uncorrelated failures are storage often enough that this is
+    the default hypothesis. Storage telemetry here is flat.
+  fabric.interconnect: >-
+    The other default for "random failures". Single-node jobs fail identically.
+  gpu.device: >-
+    Random CUDA-adjacent failures suggest hardware. CPU-only jobs fail at the
+    same rate.

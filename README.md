@@ -3,9 +3,9 @@
 **The first public incident-diagnosis benchmark for HPC schedulers.** Every
 existing root-cause-analysis benchmark for LLM agents is cloud microservices.
 
-> **Phase 1 of 6.** Scenario schema, ground-truth invariants, and five
-> scenarios. The scoring library lands in Phase 2 and the leaderboard is empty
-> until an agent has actually been measured. Published early on purpose.
+> **Phase 2 of 6.** Ten scenarios, the scoring library, and degenerate
+> baselines. The leaderboard is empty until an agent has actually been
+> measured. Published as it is built.
 
 ---
 
@@ -114,15 +114,26 @@ benchmark will ever produce.
 
 ## Scenarios
 
-Five in Phase 1, across four of the six planned families.
+Ten scenarios across all six families. `measured` means the causal chain was
+observed on a live cluster, not asserted.
 
-| ID | Title | Family | Difficulty | Hops | Cause → symptom |
-|---|---|---|---|---|---|
-| **S01** | Accounting goes dark, no error anywhere | storage | **multi-layer** | 4 | **14 min** |
-| S02 | `sacct` hangs but jobs keep running | accounting_db | single-layer | 2 | 30 s |
-| S03 | Everything is slow and the controller is pinned | controller | single-layer | 1 | 0 s |
-| S04 | One node keeps failing jobs, others are fine | gpu | single-layer | 1 | 0 s |
-| **S05** | A node rebooted and the evidence is gone | controller | **undiagnosable** | 1 | — |
+| ID | Title | Family | Difficulty | Measured |
+|---|---|---|---|---|
+| **S01** | Accounting goes dark, no error anywhere | storage | **multi-layer** | ✅ |
+| S02 | `sacct` hangs but jobs keep running | accounting_db | single-layer | — |
+| S03 | Everything is slow and the controller is pinned | controller | single-layer | — |
+| S04 | One node keeps failing jobs, others are fine | gpu | single-layer | — |
+| **S05** | A node rebooted and the evidence is gone | controller | **undiagnosable** | — |
+| S06 | Every new submission rejected, running jobs fine | storage | single-layer | ✅ |
+| S07 | Multi-node jobs crawl, single-node jobs fine | fabric | single-layer | — |
+| S08 | One account starves while the cluster idles | scheduler_config | single-layer | ⛔ blocked |
+| S09 | A node drains itself repeatedly | gpu | **multi-layer** | — |
+| **S10** | 1 job in 50 fails, no pattern anywhere | scheduler_config | **undiagnosable** | — |
+
+⛔ S08's injection is **measured not to work**: the cluster ships
+`AccountingStorageEnforce=none`, so association limits are recorded and never
+enforced. Recorded rather than dropped — a scenario whose injection silently
+does nothing would score every agent on a fault that never happened.
 
 ### S01 is the flagship
 
@@ -157,6 +168,35 @@ real work and still not a diagnosis.
 Without scenarios like this, a benchmark rewards fluent overconfidence, which is
 precisely the failure mode that makes an agent dangerous on an on-call rotation.
 At minimum one more undiagnosable scenario lands in Phase 2.
+
+## Baselines — the number to ask for first
+
+A benchmark reporting only "the agent scored 0.52" is not reporting anything,
+because the reader cannot know that answering the same node to every task
+scores 0.50. `slurm-rca baselines` computes that floor from the ground truth
+alone:
+
+```
+  degenerate baselines over 10 scenarios
+
+   0.240  always-abstain                <- floor
+   0.145  always-db.mysql
+   0.140  always-gpu.device
+   0.106  uniform-random
+```
+
+**An agent that does not clear 0.240 has demonstrated fluency, not diagnosis.**
+
+This is also how the suite audits itself. At five scenarios,
+`always-db.mysql` scored **0.290** — because S01 and S02 both rewarded it, a
+third of any agent's score was reachable without reading a single log line.
+Adding scenarios whose causes lie elsewhere dropped it to **0.145**, and a test
+now fails the build if any constant component answer climbs back above 0.25.
+The fix for a degenerate suite is more scenarios, never retuned weights.
+
+`always-abstain` sitting at the top is intentional and healthy: refusing to
+answer is *safe*, so it should score meaningfully, and it must be beatable or
+the benchmark rewards refusing to work.
 
 ## How ground truth works
 

@@ -1,0 +1,92 @@
+id: S06-state-save-unwritable
+title: Every new submission is rejected, running jobs are fine
+family: storage
+difficulty: single_layer
+
+symptom: >-
+  sbatch fails immediately for every user with "Batch job submission failed:
+  I/O error writing script/environment to file". Jobs already running are
+  unaffected and continue to completion. sinfo and squeue are normal.
+
+notes: >-
+  The counterpart to S01, and the reason both exist. Both are storage faults in
+  the same cluster, but they present in opposite ways: S01 is silent and
+  delayed, this is loud and immediate. An agent that has learned "storage
+  problems are quiet and take minutes to surface" will mis-time this one.
+
+  It also fixes a real gap in the suite. The cause is storage.state_save rather
+  than the shared filesystem, so it moves credit away from db.mysql — which the
+  degenerate-baseline check showed was scoring far too well across the suite.
+
+injection: >-
+  chmod 500 on StateSaveLocation (/var/lib/slurm) inside the slurmctld
+  container, so the controller cannot write the job script and environment.
+  Reversible with chmod 755. This is a real permission failure rather than an
+  emulation of one.
+
+observe_s: 90
+
+verification:
+  measured: true
+  method: >-
+    Live run on the benchmark's Compose project, Slurm 25.11.4. Baseline job
+    submitted and confirmed COMPLETED via sacct; chmod 500 applied; submission
+    attempted; chmod 755 restored; submission re-attempted. sacct used as the
+    source of truth because container /tmp is not shared with the worker.
+  observations:
+    "baseline": "job 1 submitted, ran, sacct shows COMPLETED"
+    "t+0s": "chmod 500 applied; StateSaveLocation is dr-x------"
+    "t+12s": "sbatch rejected: 'I/O error writing script/environment to file' — no JobID issued"
+    "t+15..60s": "queue stays empty; no pending backlog accumulates"
+    "heal+5s": "chmod 755; job 3 submitted and sacct shows COMPLETED"
+  caveats: >-
+    This is a write *failure*, not a write *stall*. A real parallel filesystem
+    hanging on StateSaveLocation would block slurmctld rather than return an
+    error, and that case is not reproduced here — it is the one remaining
+    candidate mechanism for the folk model S01 refuted. Emulating it needs a
+    fault-injecting filesystem and is deferred.
+
+causal_chain:
+  - node: storage.state_save
+    state: unwritable
+    observable_at_s: 0
+    evidence:
+      - "slurmctld log: '_slurm_rpc_submit_batch_job: I/O error writing script/environment to file'"
+      - "the error names the operation and appears on every submission attempt"
+      - "running jobs unaffected; sinfo and squeue normal"
+
+scoring:
+  - node: storage.state_save
+    credit: 1.0
+    rationale: The controller cannot write its state directory. The log says so verbatim.
+  - node: storage.shared_fs
+    credit: 0.4
+    rationale: >-
+      Right family, wrong mount. Real diagnostic progress — it correctly places
+      the fault in storage rather than in Slurm — but StateSaveLocation is a
+      specific path and the distinction determines which filesystem gets paged.
+  - node: slurm.slurmctld
+    credit: 0.1
+    rationale: >-
+      The controller emits the error, so naming it shows the agent read the
+      right log and stopped at the messenger.
+  - node: slurm.config
+    credit: 0.0
+    rationale: >-
+      Tempting because submission failures often are config, and zero because
+      the config is untouched and the error is an I/O error, not a validation one.
+  - node: unknown
+    credit: 0.05
+    rationale: The error message is explicit; abstention here is close to failure.
+
+remediation_helpful:
+  - "restore write permissions on StateSaveLocation"
+  - "check the filesystem backing StateSaveLocation for space and mount state"
+
+distractors:
+  slurm.config: >-
+    "Submission is rejected" reads like a limit or QOS problem, and an agent
+    that greps slurm.conf first will find nothing and may invent something.
+  db.mysql: >-
+    The reflex answer on this cluster after S01 and S02. The database is
+    completely healthy here, and sacct works throughout.

@@ -1,0 +1,91 @@
+id: S09-gpu-driver-node-drain
+title: A node drains itself repeatedly and comes back each time
+family: gpu
+difficulty: multi_layer
+
+symptom: >-
+  One node has drained itself four times in the last two hours, each time with
+  Reason set by the health check, and each time an operator resumed it and it
+  drained again within twenty minutes. Jobs on it fail with CUDA initialisation
+  errors.
+
+notes: >-
+  Multi-layer within a single node: the driver wedges, NVML stops answering, the
+  health check sees no GPUs and drains, an operator resumes, and the loop
+  repeats. The trap is that every individual observation points at the GPU
+  hardware, while the hardware is fine and a driver reset fixes it.
+
+  Distinguishing this from S04 is the point of having both. S04 has per-device
+  ECC counters implicating one card; here NVML fails wholesale for every device,
+  which is a driver-level signature, not a hardware one.
+
+injection: >-
+  A wrapper makes nvidia-smi and NVML queries fail with a driver-communication
+  error for all devices, and the node health check drains on that failure. The
+  cluster has no real GPUs, so this signature is synthetic by construction.
+
+observe_s: 300
+
+verification:
+  measured: false
+  caveats: Chain designed; not yet observed. Phase 2b.
+
+causal_chain:
+  - node: gpu.driver
+    state: nvml_unresponsive
+    observable_at_s: 0
+    evidence:
+      - "nvidia-smi fails for ALL devices, not one — wholesale, not per-card"
+      - "no ECC or thermal counters are readable at all, rather than reading as bad"
+      - "dmesg shows driver-level messages, not per-device XIDs"
+
+  - node: slurm.slurmd
+    state: health_check_failing
+    observable_at_s: 60
+    evidence:
+      - "the node health check exits non-zero and the node drains"
+      - "drain Reason is set by the health check, not by an operator"
+
+  - node: slurm.slurmctld
+    state: node_drained_repeatedly
+    observable_at_s: 120
+    evidence:
+      - "sinfo shows the node DRAINED; scontrol shows a repeating drain/resume history"
+      - "only this node is affected; the rest of the partition is healthy"
+
+scoring:
+  - node: gpu.driver
+    credit: 1.0
+    rationale: >-
+      The driver is wedged. Every device failing at once is the discriminator:
+      hardware faults are per-device, driver faults are wholesale.
+  - node: gpu.device
+    credit: 0.4
+    rationale: >-
+      Right node, right subsystem, wrong layer — and the action differs, since
+      a driver reset restores the node while an RMA does not. Substantial
+      partial credit because it still drains the right node.
+  - node: slurm.slurmd
+    credit: 0.15
+    rationale: >-
+      The health check is doing its job correctly. Naming it identifies the
+      mechanism that surfaces the fault, not the fault.
+  - node: slurm.config
+    credit: 0.0
+    rationale: >-
+      "The health check must be misconfigured" is a real temptation when a node
+      drains repeatedly. The health check is right; the driver is wrong.
+  - node: unknown
+    credit: 0.05
+    rationale: The wholesale-versus-per-device signature is available and decisive.
+
+remediation_helpful:
+  - "reset or reload the NVIDIA driver on the affected node"
+  - "drain the node until the driver is confirmed healthy"
+
+distractors:
+  gpu.device: >-
+    Everything about the presentation says "bad GPU", and on most clusters it
+    usually is. The tell is that all devices fail together.
+  slurm.config: >-
+    Repeated automatic drains invite blaming the health-check configuration.

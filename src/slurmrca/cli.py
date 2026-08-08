@@ -9,6 +9,7 @@ import click
 
 from slurmrca import __version__
 from slurmrca.loader import ScenarioError, load_all
+from slurmrca.scoring import baselines as compute_baselines
 from slurmrca.spec import ABSTAIN, Difficulty, Scenario
 
 
@@ -117,6 +118,26 @@ def validate() -> None:
             sys.exit(1)
         click.secho(f"✓ {scenario.id}", fg="green")
     click.echo(f"\n{len(scenarios)} scenarios, ground truth consistent")
+
+
+@main.command()
+@click.option("--top", default=8, show_default=True, help="How many strategies to show.")
+def baselines(top: int) -> None:
+    """Show what strategies that ignore all telemetry would score.
+
+    The floor any real agent must beat. A benchmark reporting only an agent's
+    score tells the reader nothing, because they cannot know that answering the
+    same node to every task scores nearly as well.
+    """
+    scenarios = load_all()
+    rows = compute_baselines(scenarios)
+    click.echo(f"\n  degenerate baselines over {len(scenarios)} scenarios\n")
+    for row in rows[:top]:
+        marker = click.style("  <- floor", fg="yellow") if row is rows[0] else ""
+        click.echo(f"  {row.rca_depth:>6.3f}  {row.name:<28}{marker}")
+    click.echo(
+        "\n  An agent that does not clear the floor has demonstrated fluency, not diagnosis.\n"
+    )
 
 
 @main.command()

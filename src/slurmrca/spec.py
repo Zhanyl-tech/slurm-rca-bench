@@ -172,6 +172,11 @@ class Scenario:
     injection: str = ""
     #: Evidence the chain was observed. Unverified chains are marked as such.
     verification: Verification = field(default_factory=lambda: Verification(measured=False))
+    #: Actions that genuinely address the root cause. Anything an agent proposes
+    #: that is not listed here counts as an action false positive, so an
+    #: under-specified list penalises the benchmark author rather than silently
+    #: crediting an agent for plausible-sounding changes.
+    remediation_helpful: tuple[str, ...] = ()
 
     # ── derived ────────────────────────────────────────────────────────────
 
@@ -345,6 +350,7 @@ def scenario_from_dict(raw: dict[str, Any]) -> Scenario:
             notes=raw.get("notes", ""),
             injection=raw.get("injection", ""),
             verification=_verification_from(raw.get("verification")),
+            remediation_helpful=tuple(raw.get("remediation_helpful", ())),
         )
     except KeyError as exc:
         raise ValueError(f"scenario missing required field: {exc}") from exc

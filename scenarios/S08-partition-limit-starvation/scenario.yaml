@@ -1,0 +1,86 @@
+id: S08-partition-limit-starvation
+title: One account's jobs never start while the cluster sits half idle
+family: scheduler_config
+difficulty: single_layer
+
+symptom: >-
+  Jobs from one account have been PENDING for hours. sinfo shows plenty of idle
+  nodes. Other accounts are running normally. squeue reports Reason=QOSMaxJobs
+  for some jobs and AssocMaxJobs for others.
+
+notes: >-
+  A configuration fault with the answer written in the Reason field, included as
+  a control for the opposite failure mode: an agent that always reaches for
+  infrastructure causes will overshoot straight past it. If a configuration with
+  the dependency graph scores *worse* here than one without, that is evidence
+  the graph is being over-applied, which is a finding worth having.
+
+injection: >-
+  sacctmgr sets a restrictive GrpJobs limit on one association, so its jobs
+  queue behind a limit rather than behind resources. Reversible by restoring
+  the previous limit.
+
+observe_s: 120
+
+verification:
+  measured: false
+  method: >-
+    Injection attempted against the benchmark cluster; the *negative* result
+    below is measured even though the causal chain is not.
+  observations:
+    "inject": "sacctmgr GrpJobs=0 applied, then sbatch succeeded — job 6 submitted normally"
+    "config": "scontrol show config reports AccountingStorageEnforce = none"
+  caveats: >-
+    BLOCKED, and measured to be blocked. The upstream cluster ships
+    AccountingStorageEnforce=none, so association limits are recorded but never
+    enforced and this injection has no effect. The scenario needs
+    AccountingStorageEnforce=limits in slurm.conf, which is a cluster-config
+    change to the benchmark image rather than a scenario change.
+
+    Recorded here rather than quietly dropped: a benchmark that ships a scenario
+    whose injection silently does nothing would score every agent on a fault
+    that never happened, and they would all appear to fail at diagnosing it.
+    The causal chain remains designed-only until the prerequisite lands.
+
+causal_chain:
+  - node: slurm.config
+    state: association_limit_reached
+    observable_at_s: 0
+    evidence:
+      - "squeue Reason field names the limit directly (QOSMaxJobs / AssocMaxJobs)"
+      - "sacctmgr show assoc reveals the restrictive GrpJobs value"
+      - "nodes are idle and other accounts schedule normally"
+
+scoring:
+  - node: slurm.config
+    credit: 1.0
+    rationale: >-
+      A limit is doing exactly what it was configured to do. The scheduler is
+      healthy; the policy is the cause.
+  - node: slurm.scheduler
+    credit: 0.15
+    rationale: >-
+      The scheduling loop is where the effect appears, and an agent that
+      inspects it has looked in a sensible place, but nothing there is faulty.
+  - node: slurm.slurmctld
+    credit: 0.05
+    rationale: Naming the controller is naming the host of the policy, not the policy.
+  - node: storage.shared_fs
+    credit: 0.0
+    rationale: >-
+      Zero, and pointedly: this is the overshoot answer for an agent that has
+      learned "PENDING jobs mean something is broken upstream".
+  - node: unknown
+    credit: 0.05
+    rationale: squeue states the reason in plain text; abstention is not defensible.
+
+remediation_helpful:
+  - "raise or remove the association GrpJobs limit"
+  - "review QOS limits for the affected account"
+
+distractors:
+  storage.shared_fs: >-
+    After S01, an agent may have learned that idle nodes plus pending jobs means
+    a storage fault. Here the Reason field says otherwise.
+  slurm.slurmctld: >-
+    "The scheduler is stuck" is the natural reading of a long PENDING queue.

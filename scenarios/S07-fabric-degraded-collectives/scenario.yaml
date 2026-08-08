@@ -1,0 +1,70 @@
+id: S07-fabric-degraded-collectives
+title: Multi-node jobs crawl, single-node jobs are fine
+family: fabric
+difficulty: single_layer
+
+symptom: >-
+  Multi-node training jobs are taking three to four times longer than last week.
+  Single-node jobs are unaffected. No job fails. GPU utilisation on the affected
+  jobs is low and spiky. Nobody changed the model code.
+
+notes: >-
+  The classic fabric problem, and the one most often misdiagnosed as a GPU or
+  application issue because the visible symptom is low GPU utilisation. The
+  discriminator is the single-node/multi-node split: a slow GPU is slow
+  everywhere, while a degraded fabric only hurts jobs that talk across nodes.
+
+injection: >-
+  tc netem applied to the control-plane network adding latency and a small loss
+  rate between worker containers, so collectives retransmit. Emulates a failing
+  cable or congested switch port; it is network-layer emulation, not a real HCA
+  fault, and it cannot reproduce per-QP or per-HCA counter signatures.
+
+observe_s: 240
+
+verification:
+  measured: false
+  caveats: >-
+    Chain is designed, not yet observed. The scenario ships marked unverified
+    rather than being held back, so the suite composition is visible, but its
+    timings must not be quoted until measured. Phase 2b.
+
+causal_chain:
+  - node: fabric.interconnect
+    state: degraded_retransmits
+    observable_at_s: 0
+    evidence:
+      - "IB/RoCE port counters: retransmit and out-of-sequence errors climbing"
+      - "only jobs spanning more than one node are affected"
+      - "GPU utilisation low and spiky on affected ranks — waiting, not computing"
+
+scoring:
+  - node: fabric.interconnect
+    credit: 1.0
+    rationale: The fabric is degraded and the port counters name it directly.
+  - node: gpu.device
+    credit: 0.0
+    rationale: >-
+      The most common wrong answer, and zero because the evidence positively
+      excludes it: the same GPUs run single-node jobs at full speed.
+  - node: network.control_plane
+    credit: 0.35
+    rationale: >-
+      Right layer, wrong network. Control-plane and data-plane fabrics are
+      distinct, but an agent naming "the network" has localised the fault
+      correctly and would escalate to the right team.
+  - node: unknown
+    credit: 0.05
+    rationale: The single-node/multi-node split is a clear discriminator.
+
+remediation_helpful:
+  - "identify and replace the degraded link or transceiver"
+  - "drain nodes attached to the affected switch port"
+
+distractors:
+  gpu.device: >-
+    Low GPU utilisation on a slow training job invites blaming the GPUs. They
+    are idle because they are waiting on the network.
+  slurm.config: >-
+    "Topology must be misconfigured" is plausible if the agent knows about
+    topology.conf, but nothing about placement changed.

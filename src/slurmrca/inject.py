@@ -164,6 +164,135 @@ def _heal_node_loss(cluster: Cluster) -> None:
     cluster.scontrol("update", "NodeName=ALL", "State=RESUME")
 
 
+# ── S06: StateSaveLocation unwritable ──────────────────────────────────────
+
+STATE_SAVE = "/var/lib/slurm"
+
+
+def _inject_state_save(cluster: Cluster) -> None:
+    """Remove write permission from StateSaveLocation.
+
+    A real permission failure rather than an emulation of one. Measured
+    behaviour: slurmctld rejects every submission immediately with an I/O
+    error, and running jobs are unaffected. Note this is a write *failure*, not
+    a write *stall* — see the scenario's caveats.
+    """
+    result = cluster.exec("slurmctld", ["chmod", "500", STATE_SAVE], timeout=30.0)
+    if not result.ok:
+        raise ClusterError(f"could not restrict {STATE_SAVE}: {result.stderr.strip()}")
+
+
+def _heal_state_save(cluster: Cluster) -> None:
+    cluster.exec("slurmctld", ["chmod", "755", STATE_SAVE], timeout=30.0)
+
+
+# ── S07: degraded fabric ───────────────────────────────────────────────────
+
+
+def _inject_fabric(cluster: Cluster) -> None:
+    """Add latency and loss to the worker's interface with tc netem.
+
+    Applied on the worker because it runs privileged; slurmctld does not have
+    NET_ADMIN. Emulates a failing link at the network layer — it cannot
+    reproduce per-QP or per-HCA counter signatures, which is stated in the
+    scenario's injection field.
+    """
+    cmd = "tc qdisc replace dev eth0 root netem delay 40ms 10ms loss 3%"
+    result = cluster.exec("cpu-worker", ["sh", "-c", cmd], timeout=60.0)
+    if not result.ok:
+        raise ClusterError(
+            f"tc netem failed (needs NET_ADMIN on the worker): {result.stderr.strip()}"
+        )
+
+
+def _heal_fabric(cluster: Cluster) -> None:
+    cluster.exec("cpu-worker", ["sh", "-c", "tc qdisc del dev eth0 root || true"], timeout=60.0)
+
+
+# ── S08: association limit starvation ──────────────────────────────────────
+
+
+def _inject_limit(cluster: Cluster) -> None:
+    """Clamp an association's job limit so its jobs queue behind policy."""
+    cmd = (
+        "sacctmgr -i modify account root set GrpJobs=0 2>&1 || "
+        "sacctmgr -i modify user root set MaxJobs=0 2>&1"
+    )
+    result = cluster.exec("slurmctld", ["sh", "-c", cmd], timeout=60.0)
+    if not result.ok:
+        raise ClusterError(f"could not set an association limit: {result.stderr.strip()}")
+
+
+def _heal_limit(cluster: Cluster) -> None:
+    cluster.exec(
+        "slurmctld",
+        [
+            "sh",
+            "-c",
+            "sacctmgr -i modify account root set GrpJobs=-1 2>&1 || true; "
+            "sacctmgr -i modify user root set MaxJobs=-1 2>&1 || true",
+        ],
+        timeout=60.0,
+    )
+
+
+# ── S09: wedged GPU driver ─────────────────────────────────────────────────
+
+_WEDGED_SMI = r"""#!/bin/sh
+# Synthetic nvidia-smi for slurm-rca-bench S09.
+# Driver-level failure: EVERY device fails to initialise, rather than one
+# device reporting bad counters. That wholesale-versus-per-device distinction
+# is what separates this scenario from S04.
+echo "Unable to determine the device handle for GPU0000:00:00.0: Unknown Error" >&2
+echo "NVML: Driver/library version mismatch" >&2
+exit 255
+"""
+
+
+def _inject_gpu_driver(cluster: Cluster) -> None:
+    script = (
+        "mkdir -p /usr/local/bin && "
+        f"cat > /usr/local/bin/nvidia-smi <<'EOF'\n{_WEDGED_SMI}EOF\n"
+        "chmod +x /usr/local/bin/nvidia-smi"
+    )
+    result = cluster.exec("cpu-worker", ["sh", "-c", script], timeout=60.0)
+    if not result.ok:
+        raise ClusterError(f"could not install wedged nvidia-smi: {result.stderr.strip()}")
+
+
+def _heal_gpu_driver(cluster: Cluster) -> None:
+    cluster.exec("cpu-worker", ["sh", "-c", "rm -f /usr/local/bin/nvidia-smi"], timeout=60.0)
+
+
+# ── S10: uncorrelated intermittent failures ────────────────────────────────
+
+_FLAKY_PROLOG = r"""#!/bin/sh
+# Synthetic prolog for slurm-rca-bench S10.
+# Fails with fixed probability, uniformly, so failures correlate with nothing
+# an agent can observe. That absence of correlation is the scenario.
+if [ $(( $(od -An -N2 -tu2 < /dev/urandom) % 50 )) -eq 0 ]; then
+    echo "prolog: transient failure" >&2
+    exit 1
+fi
+exit 0
+"""
+
+
+def _inject_flaky(cluster: Cluster) -> None:
+    script = (
+        "mkdir -p /etc/slurm/prolog.d && "
+        f"cat > /etc/slurm/prolog.d/rca-flaky <<'EOF'\n{_FLAKY_PROLOG}EOF\n"
+        "chmod +x /etc/slurm/prolog.d/rca-flaky"
+    )
+    result = cluster.exec("cpu-worker", ["sh", "-c", script], timeout=60.0)
+    if not result.ok:
+        raise ClusterError(f"could not install flaky prolog: {result.stderr.strip()}")
+
+
+def _heal_flaky(cluster: Cluster) -> None:
+    cluster.exec("cpu-worker", ["sh", "-c", "rm -f /etc/slurm/prolog.d/rca-flaky"], timeout=60.0)
+
+
 INJECTIONS: dict[str, Injection] = {
     "S01-storage-stall-scheduling-halt": Injection(
         scenario_id="S01-storage-stall-scheduling-halt",
@@ -194,6 +323,36 @@ INJECTIONS: dict[str, Injection] = {
         mechanism="SIGKILL a worker after clearing its logs, then restart it",
         inject=_inject_node_loss,
         heal=_heal_node_loss,
+    ),
+    "S06-state-save-unwritable": Injection(
+        scenario_id="S06-state-save-unwritable",
+        mechanism="chmod 500 on StateSaveLocation so the controller cannot write job state",
+        inject=_inject_state_save,
+        heal=_heal_state_save,
+    ),
+    "S07-fabric-degraded-collectives": Injection(
+        scenario_id="S07-fabric-degraded-collectives",
+        mechanism="tc netem delay and loss on the worker interface",
+        inject=_inject_fabric,
+        heal=_heal_fabric,
+    ),
+    "S08-partition-limit-starvation": Injection(
+        scenario_id="S08-partition-limit-starvation",
+        mechanism="sacctmgr clamps an association job limit to zero",
+        inject=_inject_limit,
+        heal=_heal_limit,
+    ),
+    "S09-gpu-driver-node-drain": Injection(
+        scenario_id="S09-gpu-driver-node-drain",
+        mechanism="nvidia-smi wrapper failing wholesale for every device (driver signature)",
+        inject=_inject_gpu_driver,
+        heal=_heal_gpu_driver,
+    ),
+    "S10-undiagnosable-intermittent-failures": Injection(
+        scenario_id="S10-undiagnosable-intermittent-failures",
+        mechanism="prolog hook failing with fixed probability, uncorrelated with anything",
+        inject=_inject_flaky,
+        heal=_heal_flaky,
     ),
 }
 
