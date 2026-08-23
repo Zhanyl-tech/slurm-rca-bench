@@ -192,3 +192,57 @@ class TestVerification:
                 f"{scenario.id} claims measured=true but records no observations"
             )
             assert scenario.verification.method.strip()
+
+
+class TestReadmeMatchesReality:
+    """The README's own counts, checked against the shipped scenarios.
+
+    This class exists because the counts drifted. The suite went 5 -> 10 and
+    three README call-sites kept saying five: the limitations bullet, the
+    roadmap's phase-1 row, and a roadmap that marked phase 2 "next" while the
+    banner said phase 2 was current. Every one of those is a claim about the
+    benchmark that a reader would reasonably believe, and nothing checked them.
+    """
+
+    @staticmethod
+    def readme() -> str:
+        from pathlib import Path
+
+        return (Path(__file__).resolve().parent.parent / "README.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_not_enough_to_rank_claim_names_the_real_count(self) -> None:
+        import re
+
+        words = {
+            "One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5,
+            "Six": 6, "Seven": 7, "Eight": 8, "Nine": 9, "Ten": 10,
+            "Fifteen": 15, "Twenty": 20,
+        }
+        match = re.search(
+            r"\*\*(\w+) scenarios is not enough to rank models\.\*\*", self.readme()
+        )
+        assert match, "the limitations bullet naming the scenario count is gone"
+        claimed = words.get(match.group(1))
+        assert claimed == len(SCENARIOS), (
+            f"README says {match.group(1)} ({claimed}) scenarios, "
+            f"the suite ships {len(SCENARIOS)}"
+        )
+
+    def test_no_roadmap_phase_is_both_done_and_next(self) -> None:
+        import re
+
+        for line in self.readme().splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            status = cells[-1].lower()
+            assert not ("done" in status and "next" in status), (
+                f"roadmap row is marked both done and next: {line}"
+            )
+        # and exactly one phase may be "next"
+        nexts = re.findall(r"^\|.*\|\s*next\s*\|$", self.readme(), re.MULTILINE)
+        assert len(nexts) <= 1, f"{len(nexts)} roadmap rows marked 'next'"

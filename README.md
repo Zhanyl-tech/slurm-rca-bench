@@ -3,9 +3,9 @@
 **The first public incident-diagnosis benchmark for HPC schedulers.** Every
 existing root-cause-analysis benchmark for LLM agents is cloud microservices.
 
-> **Phase 2 of 6.** Ten scenarios, the scoring library, and degenerate
-> baselines. The leaderboard is empty until an agent has actually been
-> measured. Published as it is built.
+> **Phase 2 of 6 complete.** Ten scenarios, the scoring library, and degenerate
+> baselines. Phase 3 next. The leaderboard is empty until an agent has actually
+> been measured. Published as it is built.
 
 ---
 
@@ -110,7 +110,7 @@ benchmark will ever produce.
   one node — not the physics.
 - **There are no real GPUs.** The cluster is CPU-only Docker. All GPU telemetry
   in the GPU family is synthetic by construction.
-- **Five scenarios is not enough to rank models.** Phase 2 takes it to 15–20.
+- **Ten scenarios is not enough to rank models.** Phase 3 takes it to 15–20.
   Until then, treat any number as a smoke test, not a measurement.
 - **Single Slurm version.** Everything is pinned to Slurm 25.11.4. Behaviour on
   other versions is untested.
@@ -298,8 +298,8 @@ clones it at the pinned commit. See [NOTICE](NOTICE).
 | Phase | Scope | Status |
 |---|---|---|
 | **1** | **Harness + scenario schema + 5 scenarios** | **done** |
-| 2 | Scenarios to 15–20, scoring library | next |
-| 3 | Agent configs A (raw LLM) and B (+ read-only MCP) | |
+| **2** | **Scenarios to 10, scoring library, degenerate baselines** | **done** |
+| 3 | Scenarios to 15–20; agent configs A (raw LLM) and B (+ read-only MCP) | next |
 | 4 | Dependency graph, config C, **first real comparison** | |
 | 5 | Configs D (multi-agent) and E (calibrated abstention) | |
 | 6 | Guardrails, blast-radius policy, verifier agent | |
