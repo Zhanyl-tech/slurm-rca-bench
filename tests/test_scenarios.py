@@ -208,26 +208,30 @@ class TestReadmeMatchesReality:
     def readme() -> str:
         from pathlib import Path
 
-        return (Path(__file__).resolve().parent.parent / "README.md").read_text(
-            encoding="utf-8"
-        )
+        return (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
 
     def test_not_enough_to_rank_claim_names_the_real_count(self) -> None:
         import re
 
         words = {
-            "One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5,
-            "Six": 6, "Seven": 7, "Eight": 8, "Nine": 9, "Ten": 10,
-            "Fifteen": 15, "Twenty": 20,
+            "One": 1,
+            "Two": 2,
+            "Three": 3,
+            "Four": 4,
+            "Five": 5,
+            "Six": 6,
+            "Seven": 7,
+            "Eight": 8,
+            "Nine": 9,
+            "Ten": 10,
+            "Fifteen": 15,
+            "Twenty": 20,
         }
-        match = re.search(
-            r"\*\*(\w+) scenarios is not enough to rank models\.\*\*", self.readme()
-        )
+        match = re.search(r"\*\*(\w+) scenarios is not enough to rank models\.\*\*", self.readme())
         assert match, "the limitations bullet naming the scenario count is gone"
         claimed = words.get(match.group(1))
         assert claimed == len(SCENARIOS), (
-            f"README says {match.group(1)} ({claimed}) scenarios, "
-            f"the suite ships {len(SCENARIOS)}"
+            f"README says {match.group(1)} ({claimed}) scenarios, the suite ships {len(SCENARIOS)}"
         )
 
     def test_no_roadmap_phase_is_both_done_and_next(self) -> None:

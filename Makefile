@@ -26,8 +26,11 @@ validate: install ## Check every scenario's ground truth
 test: install ## Run the test suite (no Docker required)
 	@$(BIN)/python -m pytest
 
-lint: install ## ruff
+lint: install ## ruff check + ruff format --check, exactly as CI runs them
 	@$(BIN)/ruff check .
+	@# CI runs `ruff format --check` too. It was missing here, so `make check`
+	@# could pass on a commit that CI then failed on formatting alone.
+	@$(BIN)/ruff format --check .
 
 typecheck: install ## mypy --strict
 	@$(BIN)/mypy
