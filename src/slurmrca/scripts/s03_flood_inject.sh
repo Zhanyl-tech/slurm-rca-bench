@@ -3,9 +3,9 @@
 #
 # Each loop runs under a recognisable name ($0 = slurmrca-s03-flood) and its PID
 # is written to a file. The heal kills exactly those PIDs, after checking each
-# one still carries that name. The first heal used `pkill -f 'while true'`,
-# which also matched the healing shell's own command line, so it killed itself
-# before its remaining cleanup ran.
+# one's command line still ends with that name. The first heal used
+# `pkill -f 'while true'`, which also matched the healing shell's own command
+# line, so it killed itself before its remaining cleanup ran.
 set -eu
 
 state_dir="${SLURMRCA_STATE_DIR:-/tmp/slurmrca}"
@@ -27,7 +27,29 @@ for tool in squeue sinfo; do
 done
 
 is_flood() {
-    ps -p "$1" -o args= 2>/dev/null | grep -q "$name"
+    # True while PID $1 is one of the loops: its command line ends with their
+    # name. -ww because the name sits past column 80 and ps(1) leaves the
+    # width of piped output undefined (procps cuts it at $COLUMNS). Ends with,
+    # not contains: at full width this shell's own command line, which is the
+    # whole script, contains the name too, so a recorded PID now held by an
+    # inject or heal shell would otherwise pass for a loop.
+    case "$1" in
+        *[1-9]*) ;;
+        *) return 1 ;; # PID 0 is no process, and `kill -0 0` tests this shell's group
+    esac
+    args=$(ps -ww -p "$1" -o args= 2>/dev/null || true)
+    if [ -z "$args" ] && kill -0 "$1" 2>/dev/null; then
+        # ps prints a line for every process that exists, zombies included, so
+        # nothing for one that does means ps itself failed (missing, or it
+        # rejected the options). Reading that as "gone" would drop the record
+        # of loops still running and start more, or report none started.
+        echo "ps could not read PID $1, which exists; not treating it as gone" >&2
+        exit 1
+    fi
+    case "$args" in
+        *" $name") return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 mkdir -p "$state_dir"

@@ -24,7 +24,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -243,19 +243,33 @@ def slurm_stubs(tmp_path: Path) -> Iterator[dict[str, str]]:
     pidfile = tmp_path / "st" / "S03.pids"
     if pidfile.exists():
         for line in pidfile.read_text().split():
-            if line.isdigit():
+            # Never 0: os.kill(0, ...) signals this process's whole group.
+            if line.isdigit() and int(line) > 0:
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(int(line), signal.SIGTERM)
 
 
-def _alive(pid: int) -> bool:
+def _args(pid: int) -> str:
+    """PID's whole command line as ps prints it, or "" once the process is gone.
+
+    `-ww`, because without it these checks failed in CI while the processes
+    ran. pytest imports readline; GNU readline, finding no terminal on stdin,
+    exports COLUMNS=80 into the C environment; this ps inherits it, and procps
+    cuts even piped output at $COLUMNS. Both markers below come after column
+    80. The scripts' own checks passed in the same runs because `run` gives
+    them an environment built from os.environ, which never sees that export.
+    """
     out = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "args="],
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
         capture_output=True,
         text=True,
         check=False,
     )
-    return "slurmrca-s03-flood" in out.stdout
+    return out.stdout.strip()
+
+
+def _alive(pid: int) -> bool:
+    return "slurmrca-s03-flood" in _args(pid)
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -782,8 +796,7 @@ def mysql_stub(tmp_path: Path) -> Iterator[tuple[dict[str, str], Path]]:
 
 
 def _running(pid: int) -> bool:
-    out = subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True, text=True)
-    return "slurm_acct_db" in out.stdout
+    return "slurm_acct_db" in _args(pid)
 
 
 def _clients(state: Path) -> list[int]:
@@ -872,19 +885,45 @@ def test_s02_heal_stops_a_client_left_by_an_interrupted_inject(
             client.wait()
 
 
+def _decoy(kind: str, name: str) -> subprocess.Popen[bytes]:
+    """A process that is not the injection's own, for a PID record to point at.
+
+    `script-shell` has the command line the harness gives the shell running
+    script `name` (`sh -c <the whole script> slurmrca-<name>`), so it carries
+    every marker the script mentions, as a real inject or heal shell does. It
+    only sleeps.
+    """
+    if kind == "sleep":
+        return subprocess.Popen(["sleep", "30"])
+    label = "slurmrca-" + name.removesuffix(".sh")
+    return subprocess.Popen(["sh", "-c", "sleep 30; exit\n" + script(name), label])
+
+
+@pytest.mark.parametrize("kind", ["sleep", "script-shell"])
 def test_s02_heal_never_signals_a_reused_pid(
-    tmp_path: Path, mysql_stub: tuple[dict[str, str], Path]
+    tmp_path: Path, mysql_stub: tuple[dict[str, str], Path], kind: str
 ) -> None:
-    env, _ = mysql_stub
-    decoy = subprocess.Popen(["sleep", "30"])
+    """`script-shell`: at full width the heal's own command line names mysql and the database."""
+    env, state = mysql_stub
+    decoy = _decoy(kind, "s02_lock_heal.sh")
+    record = tmp_path / "st" / "S02.pid"
     try:
-        (tmp_path / "st").mkdir()
-        (tmp_path / "st" / "S02.pid").write_text(f"{decoy.pid}\n")
+        record.parent.mkdir()
+        record.write_text(f"{decoy.pid}\n")
         healed = run("s02_lock_heal.sh", env=env)
         assert healed.returncode == 0, healed.stderr
         assert "nothing to heal" in healed.stdout
         assert decoy.poll() is None, "the heal killed a process that is not its client"
-        assert not (tmp_path / "st" / "S02.pid").exists(), "a stale record is dropped"
+        assert not record.exists(), "a stale record is dropped"
+
+        # Nor may the inject take it for an earlier client still running.
+        record.write_text(f"{decoy.pid}\n")
+        (state / "grant").touch()
+        injected = run("s02_lock_inject.sh", env=env)
+        assert injected.returncode == 0, injected.stderr
+        assert "holding a WRITE lock" in injected.stdout
+        assert run("s02_lock_heal.sh", env=env).returncode == 0
+        assert decoy.poll() is None
     finally:
         decoy.terminate()
         decoy.wait()
@@ -900,6 +939,144 @@ def test_s02_scripts_fail_when_the_database_cannot_be_reached(
     result = run(name, env=env)
     assert result.returncode != 0
     assert "nothing to heal" not in result.stdout
+
+
+# ── ps reads whole command lines, whatever width it assumes ────────────────
+#
+# ps(1): "If ps can not determine the display width, as when output is
+# redirected (piped) into a file or another command, the output width is
+# undefined"; procps cuts it at $COLUMNS, and `-ww` makes it unlimited on
+# procps and BSD ps alike. The S03 loops' name and the S02 client's database
+# name both come after column 80.
+
+
+def test_every_ps_in_the_scripts_is_full_width() -> None:
+    calls = [
+        (name, line.strip())
+        for name in ALL_SCRIPTS
+        for line in (SCRIPTS_DIR / name).read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#") and re.search(r"(^|[\s$(|;&])ps\s", line)
+    ]
+    assert len(calls) >= 4, calls  # S02 inject and heal, S03 inject and heal
+    for name, line in calls:
+        assert re.search(r"(^|[\s$(|;&])ps -ww ", line), f"{name}: {line}"
+
+
+Narrow = Callable[[dict[str, str]], dict[str, str]]
+
+
+@pytest.fixture(params=["COLUMNS=80", "80-column-ps"])
+def narrow_ps(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Narrow:
+    """Make every ps, unless given -ww, print at most 80 columns.
+
+    `COLUMNS=80` is the condition CI had. procps honours it with its output
+    piped; BSD ps ignores it when piped, so on macOS that case passes either
+    way. `80-column-ps` puts a ps first on PATH that cuts at 80 columns unless
+    given -ww, so the width bites on every platform. Both apply to the test's
+    own checks (through os.environ) and to the scripts (through the returned
+    function, which adjusts a script environment).
+    """
+    if request.param == "COLUMNS=80":
+        monkeypatch.setenv("COLUMNS", "80")
+        return lambda env: {**env, "COLUMNS": "80"}
+    real = shutil.which("ps")
+    assert real is not None
+    bin_dir = tmp_path / "narrow-ps"
+    bin_dir.mkdir()
+    write_stub(
+        bin_dir,
+        "ps",
+        'for arg in "$@"; do\n'
+        f'  if [ "$arg" = -ww ]; then exec "{real}" "$@"; fi\n'
+        "done\n"
+        f'out=$("{real}" -ww "$@")\n'
+        "status=$?\n"
+        '[ -z "$out" ] || printf "%s\\n" "$out" | cut -c1-80\n'
+        'exit "$status"',
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    return lambda env: {**env, "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}"}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_s03_finds_its_loops_under_an_80_column_ps(
+    tmp_path: Path, slurm_stubs: dict[str, str], shell: str, narrow_ps: Narrow
+) -> None:
+    """The narrow ps that failed CI's own checks, applied to the scripts.
+
+    A loop's command line is 88 characters with its name last. In CI only the
+    tests' ps ran narrow (see `_args`), but under one the scripts before `-ww`
+    were wrong too: the inject counted no loop alive and failed with all of
+    them running, and the heal found none, reported success and left them
+    running.
+    """
+    env = narrow_ps(slurm_stubs)
+    result = run("s03_flood_inject.sh", env=env, shell=shell)
+    assert result.returncode == 0, result.stderr
+    assert "started 3 of 3 RPC client loops" in result.stdout
+    pids = [int(p) for p in (tmp_path / "st" / "S03.pids").read_text().split()]
+    assert all(len(_args(p)) > 80 and _alive(p) for p in pids)
+
+    healed = run("s03_flood_heal.sh", env=env, shell=shell)
+    assert healed.returncode == 0, healed.stderr
+    deadline = time.monotonic() + 5
+    while any(_alive(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not any(_alive(p) for p in pids)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_s02_finds_its_client_under_an_80_column_ps(
+    tmp_path: Path, mysql_stub: tuple[dict[str, str], Path], shell: str, narrow_ps: Narrow
+) -> None:
+    """The client's command line has the database name last, past column 80.
+
+    Under an 80-column ps the heal did not recognise the client it recorded:
+    it left the client to the server ending its session, and a client not yet
+    connected ran on.
+    """
+    env, state = mysql_stub
+    env = narrow_ps(env)
+    (state / "grant").touch()
+    result = run("s02_lock_inject.sh", env=env, shell=shell)
+    assert result.returncode == 0, result.stderr
+    [client] = _clients(state)
+    assert len(_args(client)) > 80 and _running(client)
+
+    healed = run("s02_lock_heal.sh", env=env, shell=shell)
+    assert healed.returncode == 0, healed.stderr
+    assert f"stopped lock client {client}" in healed.stdout
+    assert not _running(client)
+
+
+@pytest.mark.parametrize("kind", ["sleep", "script-shell"])
+def test_s03_never_takes_a_reused_pid_for_a_loop(
+    tmp_path: Path, slurm_stubs: dict[str, str], kind: str
+) -> None:
+    """`script-shell`: at full width an inject or heal shell's command line contains the name.
+
+    A "contains the name" check took such a PID for a loop: the inject said
+    "already running" and started nothing, and the heal signalled it.
+    """
+    decoy = _decoy(kind, "s03_flood_heal.sh")
+    record = tmp_path / "st" / "S03.pids"
+    try:
+        record.parent.mkdir()
+        record.write_text(f"{decoy.pid}\n")
+        injected = run("s03_flood_inject.sh", env=slurm_stubs)
+        assert injected.returncode == 0, injected.stderr
+        assert "started 3 of 3 RPC client loops" in injected.stdout
+
+        with record.open("a") as fh:
+            fh.write(f"{decoy.pid}\n")
+        healed = run("s03_flood_heal.sh", env=slurm_stubs)
+        assert healed.returncode == 0, healed.stderr
+        assert decoy.poll() is None, "the heal signalled a process that is not one of its loops"
+    finally:
+        decoy.terminate()
+        decoy.wait()
 
 
 # ── A tool that fails is a failure, not an empty answer ─────────────────────
@@ -944,3 +1121,105 @@ def test_s07_heal_fails_and_keeps_its_record_when_tc_fails(tmp_path: Path, shell
     result = run("s07_netem_heal.sh", env=env, shell=shell)
     assert result.returncode != 0
     assert record.exists(), "the record is what the next heal needs"
+
+
+def _failing_ps(tmp_path: Path, env: dict[str, str]) -> dict[str, str]:
+    """`env` with a ps first on PATH that fails, as a missing one or one that rejects -ww would."""
+    bin_dir = tmp_path / "failing-ps"
+    bin_dir.mkdir()
+    write_stub(bin_dir, "ps", 'echo "ps: illegal option -- w" >&2\nexit 1')
+    return {**env, "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}"}
+
+
+def _gone(pids: list[int]) -> bool:
+    """No process has any of these PIDs, zombie or not."""
+    return not any(_args(p) for p in pids)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_s03_fails_when_ps_cannot_read_a_recorded_loop(
+    tmp_path: Path, slurm_stubs: dict[str, str], shell: str
+) -> None:
+    """A failed ps prints nothing, as it does for a process that is gone.
+
+    The heal read that as every loop gone: it printed "S03 flood stopped",
+    exited 0 and deleted the record, and every loop ran on. The inject would
+    have dropped the record as stale and started more.
+    """
+    started = run("s03_flood_inject.sh", env=slurm_stubs, shell=shell)
+    assert started.returncode == 0, started.stderr
+    pidfile = tmp_path / "st" / "S03.pids"
+    record = pidfile.read_text()
+    pids = [int(p) for p in record.split()]
+    failing = _failing_ps(tmp_path, slurm_stubs)
+    try:
+        for name in ("s03_flood_heal.sh", "s03_flood_inject.sh"):
+            result = run(name, env=failing, shell=shell)
+            assert result.returncode != 0, result.stdout
+            assert f"ps could not read PID {pids[0]}" in result.stderr
+            assert pidfile.read_text() == record, "the record of running loops is kept"
+            assert all(_alive(p) for p in pids)
+    finally:
+        # The fixture stops only what the record lists, and a heal that failed
+        # this test may have deleted it.
+        pidfile.write_text(record)
+
+    healed = run("s03_flood_heal.sh", env=slurm_stubs, shell=shell)
+    assert healed.returncode == 0, healed.stderr
+    deadline = time.monotonic() + 5
+    while not _gone(pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert _gone(pids)
+
+    # Only a PID that exists is a failure: a stale record, or a 0 in it, is not.
+    pidfile.write_text("0\n" + record)
+    stale = run("s03_flood_heal.sh", env=failing, shell=shell)
+    assert stale.returncode == 0, stale.stderr
+    assert "S03 flood stopped" in stale.stdout and not pidfile.exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_s02_fails_when_ps_cannot_read_the_recorded_client(
+    tmp_path: Path, mysql_stub: tuple[dict[str, str], Path], shell: str
+) -> None:
+    """The heal skipped a client ps could not read and could report "nothing to heal".
+
+    The inject would have dropped the record and started a second client.
+    """
+    env, state = mysql_stub
+    stub = Path(env["PATH"].split(os.pathsep)[0]) / "mysql"
+    # A client still waiting for the lock, so the inject gets as far as its record.
+    client = subprocess.Popen(
+        [str(stub), "-h", "mysql", "-uslurm", "-ppassword", "slurm_acct_db"],
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not (state / "session").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        record = tmp_path / "st" / "S02.pid"
+        record.parent.mkdir()
+        record.write_text(f"{client.pid}\n")
+        failing = _failing_ps(tmp_path, env)
+
+        for name in ("s02_lock_heal.sh", "s02_lock_inject.sh"):
+            result = run(name, env=failing, shell=shell)
+            assert result.returncode != 0, result.stdout
+            assert f"ps could not read PID {client.pid}" in result.stderr
+            assert "nothing to heal" not in result.stdout
+            assert client.poll() is None and record.exists()
+            assert _clients(state) == [client.pid], "no second client"
+
+        healed = run("s02_lock_heal.sh", env=env, shell=shell)
+        assert healed.returncode == 0, healed.stderr
+        assert f"stopped lock client {client.pid}" in healed.stdout
+        assert client.wait(timeout=5) != 0
+
+        record.write_text("0\n")
+        stale = run("s02_lock_heal.sh", env=failing, shell=shell)
+        assert stale.returncode == 0, stale.stderr
+        assert "nothing to heal" in stale.stdout and not record.exists()
+    finally:
+        if client.poll() is None:
+            client.kill()
+            client.wait()

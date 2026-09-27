@@ -101,6 +101,22 @@ the emulated cluster".
   matched the database server.
 - **S03**: client loops tracked by PID file and checked by name before being
   killed; the old `pkill -f 'while true'` killed the healing shell.
+- **S02/S03 process checks** read the whole command line (`ps -ww`) and
+  require the marker at its end. ps(1) leaves the width of piped output
+  undefined and procps cuts it at `$COLUMNS`; the loops' name and the client's
+  database name both sit past column 80. CI failed four tests on it: pytest
+  imports `readline`, GNU readline exported `COLUMNS=80` with no terminal on
+  stdin, and the tests' own `ps` inherited it (the scripts, run with an
+  environment built from `os.environ`, did not, so their checks passed). At
+  full width the inject and heal shells' own command lines, which hold the
+  whole script, contain the markers as well, so a recorded PID reused by one
+  of them passed for a loop or client: the heal signalled it, and the S03
+  inject reported "already running" and started nothing. A recorded PID that
+  exists but that `ps` prints nothing for (a missing or failing `ps`) now stops
+  the inject or heal with an error; before, the heal read it as gone, reported
+  success and dropped the record while the loops or client ran on. Tested
+  under an 80-column `ps`, a failing `ps` and with such PIDs; not run on the
+  emulated cluster.
 - **S04/S09**: never overwrite or delete an `nvidia-smi` the benchmark did not
   install.
 - **S05**: deletes only `slurmd.log` (not the controller's and dbd's logs on
@@ -161,7 +177,7 @@ the emulated cluster".
 
 ### Tests and CI
 
-- 562 tests pass and 1 is a strict expected failure (the degeneracy above), up
+- 578 tests pass and 1 is a strict expected failure (the degeneracy above), up
   from 187, measured with `pytest` on Python 3.12.13 and 3.11.15 on 2026-09-27
   while preparing this release. Replacing `Scenario.validate()` with
   `return []` in a scratch copy now fails 34 tests; in 0.1.0 it failed none.

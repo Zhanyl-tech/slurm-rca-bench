@@ -71,10 +71,26 @@ sessions() {
 
 is_client() {
     # True while PID $1 is still a mysql client for this database. A PID
-    # reused by an unrelated process is never signalled.
-    args=$(ps -p "$1" -o args= 2>/dev/null || true)
+    # reused by an unrelated process is never signalled. -ww because the
+    # database name comes last on a long command line and ps(1) leaves the
+    # width of piped output undefined (procps cuts it at $COLUMNS). The name
+    # must end the line: at full width this shell's own command line, which
+    # is the whole script, contains "mysql" and the name as well.
+    case "$1" in
+        *[1-9]*) ;;
+        *) return 1 ;; # PID 0 is no process, and `kill -0 0` tests this shell's group
+    esac
+    args=$(ps -ww -p "$1" -o args= 2>/dev/null || true)
+    if [ -z "$args" ] && kill -0 "$1" 2>/dev/null; then
+        # ps prints a line for every process that exists, zombies included, so
+        # nothing for one that does means ps itself failed (missing, or it
+        # rejected the options). Reading that as "gone" would drop the record
+        # of a client still running and start another.
+        echo "ps could not read PID $1, which exists; not treating it as gone" >&2
+        exit 1
+    fi
     case "$args" in
-        *mysql*"$db_name"*) return 0 ;;
+        *mysql*" $db_name") return 0 ;;
         *) return 1 ;;
     esac
 }
