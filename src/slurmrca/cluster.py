@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 #: Compose project name. Distinct from the upstream default (``slurm``) so a
 #: developer's own slurm-docker-cluster is never targeted by an injection.
@@ -35,10 +36,10 @@ class ExecResult:
 
     ``timed_out`` is a first-class outcome, not an error. The distinction
     between a command that *failed* and one that *never came back* is the whole
-    substance of the storage-stall family: a broken database returns an error a
-    grep can find, while a stalled filesystem returns nothing at all and the
-    caller simply waits. Collapsing both into "it didn't work" would erase the
-    signal the flagship scenario is built on.
+    substance of the flagship scenario: a broken database returns an error,
+    while a frozen one returns nothing at all and the caller simply waits.
+    Collapsing both into "it didn't work" would erase the signal S01 is built
+    on.
     """
 
     exit_code: int
@@ -54,6 +55,36 @@ class ExecResult:
     def blocked(self) -> bool:
         """True when the command hung rather than returning a failure."""
         return self.timed_out
+
+
+class ClusterOps(Protocol):
+    """What an injection or heal may do to the cluster.
+
+    Injections are written against this rather than :class:`Cluster` so they
+    can be exercised against a recording fake in tests. There is no Docker in
+    CI's unit job, and the audit that prompted this found five injections whose
+    defects (a heal that killed the database server, a heal that could not find
+    a stopped container) were visible from the commands alone.
+    """
+
+    def exec(
+        self,
+        service: str,
+        command: list[str],
+        *,
+        timeout: float = ...,
+        user: str | None = ...,
+    ) -> ExecResult: ...
+
+    def state(self, service: str) -> str: ...
+
+    def pause(self, service: str) -> None: ...
+
+    def unpause(self, service: str) -> None: ...
+
+    def kill(self, service: str, signal: str = ...) -> None: ...
+
+    def start(self, service: str) -> None: ...
 
 
 class Cluster:
@@ -114,12 +145,37 @@ class Cluster:
     # ── container operations ───────────────────────────────────────────────
 
     def container(self, service: str) -> str:
-        """Resolve a service name to its container id in this project."""
-        result = self._compose("ps", "-q", service, timeout=60.0)
+        """Resolve a service name to its container id in this project.
+
+        ``--all`` matters: by default ``docker compose ps`` shows only running
+        containers (https://docs.docker.com/reference/cli/docker/compose/ps/),
+        so the S05 heal could never find the worker it had just killed and the
+        cluster stayed down.
+        """
+        result = self._compose("ps", "--all", "-q", service, timeout=60.0)
         cid = result.stdout.strip().splitlines()
         if result.returncode != 0 or not cid:
-            raise ClusterError(f"service {service!r} not running in project {self.project!r}")
+            raise ClusterError(f"service {service!r} has no container in project {self.project!r}")
         return cid[0]
+
+    def state(self, service: str) -> str:
+        """Docker's state for the service's container.
+
+        One of ``created``, ``running``, ``paused``, ``restarting``,
+        ``removing``, ``exited`` or ``dead`` (the ContainerState.Status enum of
+        the Docker Engine API). Heals check it first so they are idempotent:
+        ``docker unpause`` on a container that is not paused is an error.
+        """
+        result = subprocess.run(  # noqa: S603
+            [self.docker, "inspect", "--format", "{{.State.Status}}", self.container(service)],
+            capture_output=True,
+            text=True,
+            timeout=60.0,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ClusterError(f"docker inspect {service} failed: {result.stderr.strip()}")
+        return result.stdout.strip()
 
     def exec(
         self,
@@ -141,12 +197,14 @@ class Cluster:
         return ExecResult(result.returncode, result.stdout, result.stderr)
 
     def pause(self, service: str) -> None:
-        """SIGSTOP every process in a container.
+        """Freeze every process in a container with ``docker pause``.
 
-        This is how a storage stall is emulated: the service neither fails nor
-        answers, so callers block on an unbounded wait rather than receiving an
-        error. Errors are easy to diagnose; silence is what makes the flagship
-        scenario hard.
+        On Linux this uses the cgroup freezer, not SIGSTOP: the processes are
+        suspended without being signalled, so they cannot notice or react
+        (https://docs.docker.com/reference/cli/docker/container/pause/). The
+        service neither fails nor answers, so callers block on an unbounded
+        wait rather than receiving an error. Errors are easy to diagnose;
+        silence is what makes the flagship scenario hard.
         """
         self._run_docker("pause", self.container(service))
 
@@ -161,6 +219,11 @@ class Cluster:
     def start(self, service: str) -> None:
         """Start a stopped container."""
         self._run_docker("start", self.container(service))
+
+    def image_ids(self) -> str:
+        """Image ids of this project's containers, for stamping transcripts."""
+        result = self._compose("images", "--quiet", timeout=60.0)
+        return " ".join(result.stdout.split())
 
     def logs(self, service: str, *, tail: int = 500) -> str:
         """Recent logs for a service."""

@@ -2,6 +2,9 @@ id: S04-gpu-ecc-drain
 title: One node keeps failing jobs, others are fine
 family: gpu
 difficulty: single_layer
+status: runnable
+reported_node: slurm.slurmd
+canary: 561eea3d-b131-4254-a509-c2ca25821b38
 
 symptom: >-
   Jobs assigned to one GPU node fail within minutes with CUDA errors. The same
@@ -15,21 +18,31 @@ notes: >-
   practice that still leads to the correct action of draining the node.
 
 injection: >-
-  The GPU worker's nvidia-smi is replaced with a wrapper emitting a synthetic
-  volatile uncorrectable ECC count and a row-remap failure. The cluster has no
-  real GPUs, so all GPU telemetry in this benchmark is synthetic by construction;
-  see the README limitations.
+  The worker's nvidia-smi is replaced with a script that prints a synthetic
+  volatile uncorrectable ECC count and a row-remap failure, whatever arguments
+  it is given. That text is the only evidence this scenario produces. The
+  cluster has one CPU worker, no GPU node, no Gres and no workload, so the
+  failing jobs and the "elsewhere" in the ticket are not reproduced; an agent
+  that looks for them in sacct finds nothing. Since 2026-09 the install refuses
+  to overwrite an nvidia-smi it did not write and the heal deletes only its own
+  file. Not yet run on the emulated cluster.
 
 observe_s: 180
+
+verification:
+  measured: false
+  caveats: >-
+    Design only; never run. The synthetic output approximates `nvidia-smi -q -d
+    ECC` and has not been compared with a real device's output. Reproducing the
+    ticket itself needs a second worker and a workload generator.
 
 causal_chain:
   - node: gpu.device
     state: uncorrectable_ecc_volatile
     observable_at_s: 0
     evidence:
-      - "nvidia-smi: volatile uncorrectable ECC errors non-zero on one device"
-      - "row remap: failure state on the same device"
-      - "errors are per-device and confined to a single node"
+      - "nvidia-smi on the worker: volatile uncorrectable ECC errors non-zero on one device"
+      - "nvidia-smi on the worker: row remapping failure on the same device"
 
 scoring:
   - node: gpu.device

@@ -2,6 +2,9 @@ id: S03-controller-rpc-saturation
 title: Everything is slow and the controller is pinned
 family: controller
 difficulty: single_layer
+status: runnable
+reported_node: slurm.slurmctld
+canary: 786511de-2d9f-4339-98b4-234cf243cecb
 
 symptom: >-
   squeue takes 10-30 seconds to return. Job submission is slow. sinfo is slow.
@@ -14,19 +17,28 @@ notes: >-
   always look further upstream should be penalised for overshooting.
 
 injection: >-
-  A tight loop of squeue/sinfo RPCs from multiple clients saturates slurmctld's
-  RPC threads. Emulates a badly-behaved user script or monitoring agent, which is
-  one of the most common real causes of controller saturation.
+  Eight tight loops of squeue/sinfo calls, started inside the slurmctld
+  container, saturate slurmctld's RPC handling. Emulates a badly-behaved user
+  script or monitoring agent, which is one of the most common real causes of
+  controller saturation. The loops are tracked by PID file since 2026-09: the
+  old heal's `pkill -f 'while true'` matched its own shell and killed itself.
+  Not yet run on the emulated cluster.
 
 observe_s: 180
+
+verification:
+  measured: false
+  caveats: >-
+    Design only; never run. Whether eight loops in one container are enough to
+    push squeue to 10-30 seconds on this cluster is unmeasured.
 
 causal_chain:
   - node: slurm.slurmctld
     state: rpc_thread_exhaustion
     observable_at_s: 0
     evidence:
-      - "sdiag: Agent queue size and RPC counts far above baseline"
-      - "sdiag: one RPC type dominates the call count"
+      - "sdiag: RPC counts far above baseline"
+      - "sdiag: the RPC types issued by squeue and sinfo dominate the per-type counts"
       - "slurmctld CPU near saturation"
 
 scoring:
@@ -34,7 +46,7 @@ scoring:
     credit: 1.0
     rationale: >-
       The controller is genuinely the bottleneck, and sdiag names the offending
-      RPC type directly.
+      RPC types directly.
   - node: db.mysql
     credit: 0.0
     rationale: >-
@@ -42,7 +54,9 @@ scoring:
       every controller problem is really a storage or DB problem lands here.
   - node: storage.shared_fs
     credit: 0.0
-    rationale: Overshoot. Storage is healthy and the telemetry shows it.
+    rationale: >-
+      Overshoot. The cluster's shared volumes (job files, configuration, logs)
+      are untouched here, and nothing beneath the controller is involved.
   - node: unknown
     credit: 0.05
     rationale: Abstention on a solvable single-hop task earns very little.

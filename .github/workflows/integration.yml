@@ -1,0 +1,72 @@
+name: integration
+
+# Runs every runnable scenario's inject/observe/heal lifecycle against the real
+# emulated cluster on a GitHub-hosted runner, which has Docker. Manual only: it
+# builds Slurm from source (upstream's Dockerfile) and takes a long time.
+#
+# Status: written in 0.2.0 and NEVER RUN. The first run is expected to find
+# problems; that is its purpose. Nothing in the README may be marked measured
+# on the strength of this workflow until a run's logs back it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Space-separated scenario ids (default: every runnable one)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: build the pinned upstream image
+        run: sh cluster/build-image.sh
+      - name: bring the cluster up
+        run: |
+          docker compose --project-name slurmrca --file cluster/docker-compose.yml up -d --wait
+          docker compose --project-name slurmrca --file cluster/docker-compose.yml exec -T slurmctld sinfo
+      - name: heal everything first (must succeed on a clean cluster)
+        run: slurm-rca heal --all
+      - name: run each scenario's lifecycle
+        env:
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          set -o pipefail
+          mkdir -p results
+          if [ -z "$SCENARIOS" ]; then
+            SCENARIOS=$(slurm-rca export --view scorer | python -c 'import json,sys; print(" ".join(s["id"] for s in json.load(sys.stdin) if s["status"] == "runnable"))')
+          fi
+          status=0
+          for id in $SCENARIOS; do
+            echo "::group::$id"
+            slurm-rca run "$id" 2>&1 | tee "results/$id.log" || status=1
+            docker compose --project-name slurmrca --file cluster/docker-compose.yml ps --all | tee -a "results/$id.log"
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: heal everything again and check health
+        if: always()
+        run: |
+          slurm-rca heal --all
+          docker compose --project-name slurmrca --file cluster/docker-compose.yml exec -T slurmctld sinfo
+      - name: collect logs
+        if: always()
+        run: |
+          mkdir -p results
+          docker compose --project-name slurmrca --file cluster/docker-compose.yml logs --no-color > results/compose.log 2>&1 || true
+          docker compose --project-name slurmrca --file cluster/docker-compose.yml images > results/images.txt 2>&1 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: integration-results
+          path: results/

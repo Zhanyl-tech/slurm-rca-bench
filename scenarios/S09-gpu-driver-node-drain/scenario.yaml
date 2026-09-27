@@ -2,6 +2,18 @@ id: S09-gpu-driver-node-drain
 title: A node drains itself repeatedly and comes back each time
 family: gpu
 difficulty: multi_layer
+status: blocked
+blocked_reason: >-
+  Hops two and three need a node health check, and the pinned upstream
+  slurm.conf has `#HealthCheckProgram=` and `#HealthCheckInterval=0` commented
+  out, so nothing ever calls the synthetic nvidia-smi and the node never drains.
+  There is also no GPU node (one CPU worker, no Gres) and no workload, so no job
+  fails with CUDA errors. Unblocking needs a slurm.conf overlay that sets
+  HealthCheckProgram to a script calling nvidia-smi, and a workload generator.
+  A run is not an unblocking condition: as for every runnable scenario, it is
+  what would later mark the chain measured.
+reported_node: slurm.slurmd
+canary: 2f9c4756-e7cd-4e22-bdb3-1e587e423c98
 
 symptom: >-
   One node has drained itself four times in the last two hours, each time with
@@ -17,18 +29,21 @@ notes: >-
 
   Distinguishing this from S04 is the point of having both. S04 has per-device
   ECC counters implicating one card; here NVML fails wholesale for every device,
-  which is a driver-level signature, not a hardware one.
+  which is a driver-level signature, not a hardware one. Blocked; kept so the
+  design and the reason are visible.
 
 injection: >-
-  A wrapper makes nvidia-smi and NVML queries fail with a driver-communication
-  error for all devices, and the node health check drains on that failure. The
-  cluster has no real GPUs, so this signature is synthetic by construction.
+  A synthetic nvidia-smi that fails for every device with a driver-communication
+  error. As shipped, nothing calls it (see blocked_reason). Since 2026-09 the
+  install refuses to overwrite an nvidia-smi it did not write and the heal
+  deletes only its own file. The cluster has no real GPUs, so this signature is
+  synthetic by construction. Not yet run on the emulated cluster.
 
 observe_s: 300
 
 verification:
   measured: false
-  caveats: Chain designed; not yet observed. Phase 2b.
+  caveats: Chain designed, not observed, and blocked (see blocked_reason).
 
 causal_chain:
   - node: gpu.driver
@@ -37,7 +52,7 @@ causal_chain:
     evidence:
       - "nvidia-smi fails for ALL devices, not one — wholesale, not per-card"
       - "no ECC or thermal counters are readable at all, rather than reading as bad"
-      - "dmesg shows driver-level messages, not per-device XIDs"
+      - "dmesg shows driver-level messages, not per-device XIDs (not emulated)"
 
   - node: slurm.slurmd
     state: health_check_failing
@@ -80,8 +95,8 @@ scoring:
     rationale: The wholesale-versus-per-device signature is available and decisive.
 
 remediation_helpful:
-  - "reset or reload the NVIDIA driver on the affected node"
-  - "drain the node until the driver is confirmed healthy"
+  - "reset:gpu.driver"
+  - "drain:slurm.slurmd"
 
 distractors:
   gpu.device: >-

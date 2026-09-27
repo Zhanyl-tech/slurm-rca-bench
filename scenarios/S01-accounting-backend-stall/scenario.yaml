@@ -1,0 +1,187 @@
+id: S01-accounting-backend-stall
+title: Accounting goes dark and the controller's queue climbs; sacct hangs without an error
+family: accounting_db
+difficulty: multi_layer
+status: runnable
+reported_node: slurm.slurmdbd
+canary: e436fbaa-5d72-4e5d-884f-92f1da3b00a4
+
+symptom: >-
+  sacct and sreport have been hanging for the last twenty minutes — they never
+  return, they never error. Jobs are still running and users are not complaining
+  about throughput. Nothing was deployed today. The monitoring dashboard for job
+  history is blank.
+
+notes: >-
+  The flagship scenario. The component the report points at (slurmdbd, behind
+  sacct) is running and accepting connections. The cause is one layer beneath
+  it, and the only positive signal is one layer above it, in the controller.
+  Nothing in the path returns an error.
+
+  The difficulty is the *shape* of the failure, not its depth alone. A broken
+  database returns an error a grep can find. A frozen one returns nothing, so
+  every caller simply waits, and the only positive signal anywhere is a queue
+  depth that grows slowly in sdiag output nobody is watching.
+
+  IMPORTANT — this scenario has been corrected twice.
+
+  1. After measurement. Its first version claimed the stall propagates to a
+  full scheduling halt about thirteen minutes in, with jobs stuck PENDING. That
+  is a widely-believed folk model and it is false: measured on a live cluster,
+  slurmctld keeps scheduling throughout and jobs run to completion the entire
+  time. See the verification block below.
+
+  2. After an audit (2026-09). The first correction still gave full credit to
+  storage.shared_fs, a stalled shared filesystem beneath the database. Nothing
+  shared sits beneath the emulated cluster's database: the Slurm containers
+  share Docker volumes (job files at /data, configuration and logs), but the
+  database keeps its data on a volume of its own, no injection slows any
+  shared volume, and there is no storage telemetry. The injection freezes the
+  database container itself. An agent that read this
+  cluster faithfully could only ever find a frozen database, and would have
+  scored 0.45 for it while full credit sat on a layer that does not exist
+  here. Full credit now goes to db.mysql and storage.shared_fs earns zero. The
+  storage-beneath-the-database story needs an injection that really slows the
+  storage under MariaDB, and a measurement of it, before any scenario may claim
+  it. The id changed from S01-storage-stall-scheduling-halt for the same
+  reason; the old id still resolves.
+
+injection: >-
+  `docker pause` on the MariaDB container. On Linux this uses the cgroup
+  freezer: every process in the container is suspended without being signalled,
+  so it cannot notice or react
+  (https://docs.docker.com/reference/cli/docker/container/pause/). Callers wait
+  on a backend that neither fails nor answers. That is the shape of a database
+  stalled on storage beneath it, but the fault is in the database container
+  itself; nothing below the database is emulated. The inject and heal wrappers
+  gained a state check in 2026-09 (pause only a running container, unpause only
+  a paused one) and have not been re-run since.
+
+observe_s: 900
+
+verification:
+  measured: true
+  method: >-
+    Live run against the benchmark's own Compose project (slurmrca) on Slurm
+    25.11.4. mysql paused via `docker pause`; probes every 10-60s for ~16
+    minutes running sacct, sinfo, sdiag, sbatch and squeue from the slurmctld
+    container; healed with `docker unpause` and re-probed. The probes were run
+    by hand and their raw transcript was not committed; the observations below
+    are transcribed from it. `make smoke` re-runs the probes (it now includes
+    sbatch and squeue and writes a transcript under
+    evidence/S01-accounting-backend-stall/, to be committed).
+  observations:
+    "t+0s": "baseline — sacct ok, sinfo ok, node c1 idle, DBD Agent queue size 0"
+    "t+5s": "sacct BLOCKS (no return, no error); sinfo still returns normally"
+    "t+60s": "sacct still blocked; sdiag reachable; DBD Agent queue size 1"
+    "t+180s": "sdiag DBD Agent queue size reaches 6 on a second run (make smoke)"
+    "t+840s": "sdiag DBD Agent queue size 6 and climbing; sbatch still accepted"
+    "t+900s": "submitted jobs reach the node and run; queue drains to empty"
+    "heal+10s": "sacct returns immediately; queued records flush — jobs 4 and 5 both COMPLETED"
+  caveats: >-
+    Queue growth is driven by accounting traffic, not elapsed time. Two runs
+    reached a depth of 6 at t+180s and t+840s respectively, so observable_at_s
+    below records when the signal was reliably *visible* in the slower run, not
+    a rate. Any scoring that depends on a precise queue depth at a precise time
+    would be measuring cluster activity rather than the agent.
+
+    The first hop (the database frozen at t+0) is the injection itself and true
+    by construction; hops two and three are timed by the observations above.
+
+    The measurement REFUTED the original chain. Jobs 4 and 5 were submitted
+    while the backend was stalled and both completed, with their accounting
+    records queued and flushed on heal, so scheduling never halted. Job start
+    latency did degrade to tens of seconds, which is a real effect and is what
+    the chain now claims. The 780s "scheduling halts" hop has been removed.
+
+    Hypothesis, unverified here: a storage-induced scheduling halt might be
+    reachable through StateSaveLocation rather than the accounting path, if
+    slurmctld blocks on state writes to a stalled filesystem. S06 measured a
+    write *failure* there, not a stall, so this remains untested and this
+    scenario does not claim it.
+
+causal_chain:
+  - node: db.mysql
+    state: frozen_no_error
+    observable_at_s: 0
+    evidence:
+      - "every query to the database waits instead of returning an error"
+      - "docker inspect reports the database container paused (visible only to an agent with Docker access)"
+
+  - node: slurm.slurmdbd
+    state: waiting_on_db
+    observable_at_s: 5
+    evidence:
+      - "sacct blocks with no return and no error (measured at t+5s)"
+      - "sinfo keeps returning normally (measured at t+5s)"
+
+  - node: slurm.slurmctld
+    state: dbd_agent_queue_growing
+    observable_at_s: 840
+    evidence:
+      - "sdiag: 'DBD Agent queue size' climbs (measured 0 -> 1 by t+60s; 6 at t+180s on one run and t+840s on another)"
+      - "scheduling continues: jobs submitted during the stall ran to completion (measured)"
+
+scoring:
+  - node: db.mysql
+    credit: 1.0
+    rationale: >-
+      The injected fault. The database is frozen: it neither answers nor
+      errors, and everything downstream waits on it. Nothing beneath it is part
+      of this cluster, so there is no deeper cause for an agent to find.
+
+  - node: slurm.slurmdbd
+    credit: 0.2
+    rationale: >-
+      The component the ticket points at. slurmdbd is running and blocked on
+      the database, so naming it identifies the transmission path but stops one
+      hop short. It earned 0.3 until the reported-component cap (0.2) was
+      enforced for every scenario; S02 gives the same answer 0.2 for the same
+      reason.
+
+  - node: slurm.slurmctld
+    credit: 0.1
+    rationale: >-
+      The controller is where a growing queue is visible, and spotting it is
+      evidence the agent read sdiag rather than just the logs. It is still the
+      furthest-downstream observation, so it earns very little.
+
+  - node: slurm.scheduler
+    credit: 0.0
+    rationale: >-
+      Zero, and specifically because the measurement showed scheduling does not
+      fail here. An agent naming the scheduler is asserting a consequence that
+      does not occur.
+
+  - node: storage.shared_fs
+    credit: 0.0
+    rationale: >-
+      Zero. This was the full-credit answer until the 2026-09 audit. No
+      shared filesystem sits beneath this cluster's database (the Slurm
+      containers' shared volumes are untouched), and nothing produces a
+      storage signal, so an agent naming it is reciting the folk model rather
+      than reading the evidence.
+
+  - node: unknown
+    credit: 0.05
+    rationale: >-
+      A small consolation for honest abstention. Deliberately non-zero: an agent
+      that says "I cannot tell" is more useful at 3am than one that confidently
+      restarts the controller. Deliberately tiny: this scenario is solvable from
+      the telemetry provided.
+
+distractors:
+  storage.shared_fs: >-
+    In production a database that stops answering without an error is often
+    stalled on the storage beneath it, and the original version of this
+    scenario said exactly that. Nothing in this cluster shows a storage signal.
+  slurm.config: >-
+    Nothing was deployed, but an agent that cannot find a live cause often
+    retreats to "someone must have changed a limit". The config is unchanged.
+  slurm.slurmd: >-
+    Nodes are idle and healthy, which invites "the nodes must not be
+    registering". They are registering fine and running jobs throughout.
+  network.control_plane: >-
+    Hanging clients look like a network partition, and this is the most
+    defensible wrong answer: the failure genuinely presents as silence. What
+    rules it out is that other RPCs (sinfo, sdiag) keep returning.

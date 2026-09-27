@@ -2,12 +2,29 @@ id: S10-undiagnosable-intermittent-failures
 title: About one job in fifty fails, and nobody can find a pattern
 family: scheduler_config
 difficulty: undiagnosable
+status: blocked
+blocked_reason: >-
+  The cluster cannot produce this ground truth. The chain's evidence is that
+  the failures correlate with nothing: not node, partition, job size or user.
+  With one worker node, one partition that has a node in it (the pinned
+  slurm.conf's gpu partition has none here) and one submitting user, that
+  absence of correlation cannot be shown, only assumed. The original injection
+  also could not work: it wrote a prolog that never executed (the pinned
+  slurm.conf has `#Prolog=` commented out), and had it executed, Slurm drains a
+  node whose Prolog fails (https://slurm.schedmd.com/prolog_epilog.html), a loud
+  signal that would make the scenario diagnosable. The 2026-09 replacement puts
+  the failure in a submitted workload. Unblocking needs at least two workers, a
+  second partition with nodes and a second submitting user. A run is not an
+  unblocking condition: as for every runnable scenario, a run showing roughly
+  2% of the workload's jobs failing within observe_s is what would later mark
+  the chain measured.
+reported_node: slurm.slurmd
+canary: 85a75350-1ce2-4e08-b599-3107da1fe87a
 
 symptom: >-
-  Roughly 2% of jobs have been exiting non-zero for the past week. The failures
-  are spread across every node, every partition, every user, and every job size.
-  Rerunning a failed job usually succeeds. No node shows hardware errors and no
-  daemon has restarted.
+  Roughly 2% of jobs have been exiting non-zero for the past week. Rerunning a
+  failed job usually succeeds. Users want to know what is wrong with the
+  cluster.
 
 notes: >-
   The second undiagnosable scenario, and a harder one than S05 because the
@@ -22,32 +39,45 @@ notes: >-
   dangerous situation, because a capable agent can always construct a narrative
   from enough data.
 
-  The scored-correct answer is abstention plus the ruled-out set. An agent that
-  reports "2% failure rate, uncorrelated with node, partition, user, size or
-  time; no infrastructure cause identified; recommend instrumenting the
-  application" is doing excellent work and should score full marks.
+  The ideal answer is abstention plus what the evidence rules out, for example
+  "2% failure rate, uncorrelated with node, partition, user, size or time; no
+  infrastructure cause identified; instrument the application". The ruled-out
+  part is recorded but not yet scored (see S05).
+
+  Open design question: an agent that reads the job script can see the failure
+  is in the workload. The vocabulary has no application node, so abstention
+  (no infrastructure cause) stays the scored-correct answer, but whether that
+  still counts as "undiagnosable" deserves a second opinion before this is
+  unblocked. The ticket no longer tells the agent that nobody can find a
+  pattern; that was the conclusion the agent is supposed to reach.
 
 injection: >-
-  A prolog hook fails with a small fixed probability, uniformly across nodes and
-  users, producing failures with no infrastructure correlate. The randomness is
-  seeded so the failure set is reproducible across runs even though it is
-  uncorrelated with anything an agent can observe.
+  A workload of 300 short jobs named slurmrca-s10 is submitted from the
+  controller. Each job fails when a hash of its Slurm job id lands in one of 50
+  buckets, so about 2% fail, the failing set is the same whenever the same job
+  ids run, and failure correlates with nothing about the node, user or time.
+  (The earlier claim that "the randomness is seeded" was false: the old script
+  read /dev/urandom.) The heal cancels only jobs with that name owned by the
+  submitting user and removes the job script only if it carries the benchmark's
+  marker. Not yet run on the emulated cluster.
 
 observe_s: 300
 
 verification:
   measured: false
-  caveats: Chain designed; not yet observed. Phase 2b.
+  caveats: >-
+    Design only; never run, and blocked (see blocked_reason). The 2% rate is a
+    property of the job script's hash, checked over job ids 1-10000 in the unit
+    tests; it is not an observation of the cluster.
 
 causal_chain:
   - node: slurm.slurmd
     state: intermittent_job_failure
     observable_at_s: 0
     evidence:
-      - "sacct: ~2% non-zero exits spread uniformly across nodes, users, partitions"
+      - "sacct: about 2% of jobs end FAILED with a non-zero exit code"
       - "no correlation with node, time of day, job size or partition"
       - "no hardware errors, no daemon restarts, no config changes"
-      - "the absence of any correlation is itself the finding"
 
 scoring:
   - node: unknown
@@ -75,17 +105,18 @@ scoring:
     credit: 0.0
     rationale: >-
       The most seductive wrong answer, because intermittent failures often are
-      storage. Storage latency is flat throughout and the failures do not
-      cluster in time.
+      storage. The workload runs from a shared job directory, but nothing
+      about that volume is degraded, and the failures do not cluster in time.
 
-remediation_helpful:
-  - "instrument the application to capture failure context"
-  - "no infrastructure change is warranted on this evidence"
+# Deliberately empty: no infrastructure change is warranted on this evidence,
+# so every proposed action counts as a false positive. (The helpful action,
+# instrumenting the application, is outside the closed action vocabulary.)
+remediation_helpful: []
 
 distractors:
   storage.shared_fs: >-
     Intermittent, uncorrelated failures are storage often enough that this is
-    the default hypothesis. Storage telemetry here is flat.
+    the default hypothesis.
   fabric.interconnect: >-
     The other default for "random failures". Single-node jobs fail identically.
   gpu.device: >-

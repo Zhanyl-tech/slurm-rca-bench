@@ -2,27 +2,37 @@ id: S06-state-save-unwritable
 title: Every new submission is rejected, running jobs are fine
 family: storage
 difficulty: single_layer
+status: runnable
+reported_node: slurm.slurmctld
+canary: e7a5b681-30d1-48cf-b8f1-0e527aaad6af
 
 symptom: >-
-  sbatch fails immediately for every user with "Batch job submission failed:
-  I/O error writing script/environment to file". Jobs already running are
-  unaffected and continue to completion. sinfo and squeue are normal.
+  Nobody can submit jobs: sbatch fails immediately for every user with an I/O
+  error. Jobs that were already running carry on and finish. sinfo and squeue
+  look normal.
 
 notes: >-
-  The counterpart to S01, and the reason both exist. Both are storage faults in
-  the same cluster, but they present in opposite ways: S01 is silent and
-  delayed, this is loud and immediate. An agent that has learned "storage
+  The counterpart to S01, and the reason both exist. Both put the controller's
+  dependencies under stress, but they present in opposite ways: S01 is silent
+  and delayed, this is loud and immediate. An agent that has learned "backend
   problems are quiet and take minutes to surface" will mis-time this one.
 
   It also fixes a real gap in the suite. The cause is storage.state_save rather
-  than the shared filesystem, so it moves credit away from db.mysql — which the
+  than the database, so it moves credit away from db.mysql — which the
   degenerate-baseline check showed was scoring far too well across the suite.
 
+  The ticket used to quote the full error text, which is also the controller's
+  log line. It now says what a user would report ("an I/O error"), so the
+  operator-level string is something the agent has to go and find.
+
 injection: >-
-  chmod 500 on StateSaveLocation (/var/lib/slurm) inside the slurmctld
-  container, so the controller cannot write the job script and environment.
-  Reversible with chmod 755. This is a real permission failure rather than an
-  emulation of one.
+  chmod 500 on StateSaveLocation (/var/lib/slurm, created 0755 by the pinned
+  upstream Dockerfile) inside the slurmctld container, so the controller cannot
+  write the job script and environment. Since 2026-09 the inject records the
+  directory's mode first and the heal restores that recorded mode, instead of
+  always setting 755. This is a real permission failure rather than an
+  emulation of one. The record-and-restore wrapper has not been re-run on the
+  emulated cluster.
 
 observe_s: 90
 
@@ -32,7 +42,8 @@ verification:
     Live run on the benchmark's Compose project, Slurm 25.11.4. Baseline job
     submitted and confirmed COMPLETED via sacct; chmod 500 applied; submission
     attempted; chmod 755 restored; submission re-attempted. sacct used as the
-    source of truth because container /tmp is not shared with the worker.
+    source of truth because container /tmp is not shared with the worker. Run
+    by hand; the raw transcript was not committed.
   observations:
     "baseline": "job 1 submitted, ran, sacct shows COMPLETED"
     "t+0s": "chmod 500 applied; StateSaveLocation is dr-x------"
@@ -41,10 +52,10 @@ verification:
     "heal+5s": "chmod 755; job 3 submitted and sacct shows COMPLETED"
   caveats: >-
     This is a write *failure*, not a write *stall*. A real parallel filesystem
-    hanging on StateSaveLocation would block slurmctld rather than return an
-    error, and that case is not reproduced here — it is the one remaining
-    candidate mechanism for the folk model S01 refuted. Emulating it needs a
-    fault-injecting filesystem and is deferred.
+    hanging on StateSaveLocation might block slurmctld rather than return an
+    error; that case is not reproduced here and is unverified. It is the one
+    remaining candidate mechanism for the folk model S01 refuted. Emulating it
+    needs a fault-injecting filesystem and is deferred.
 
 causal_chain:
   - node: storage.state_save
@@ -65,6 +76,9 @@ scoring:
       Right family, wrong mount. Real diagnostic progress — it correctly places
       the fault in storage rather than in Slurm — but StateSaveLocation is a
       specific path and the distinction determines which filesystem gets paged.
+      Here the two really are different: the shared volumes in
+      cluster/docker-compose.yml are /data, /etc/slurm, /etc/munge and
+      /var/log/slurm, and StateSaveLocation (/var/lib/slurm) is on none of them.
   - node: slurm.slurmctld
     credit: 0.1
     rationale: >-
@@ -80,8 +94,8 @@ scoring:
     rationale: The error message is explicit; abstention here is close to failure.
 
 remediation_helpful:
-  - "restore write permissions on StateSaveLocation"
-  - "check the filesystem backing StateSaveLocation for space and mount state"
+  - "repair:storage.state_save"
+  - "investigate:storage.state_save"
 
 distractors:
   slurm.config: >-

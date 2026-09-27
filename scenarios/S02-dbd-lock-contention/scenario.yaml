@@ -2,40 +2,64 @@ id: S02-dbd-lock-contention
 title: sacct hangs but jobs keep running
 family: accounting_db
 difficulty: single_layer
+status: runnable
+reported_node: slurm.slurmdbd
+canary: d9f56bb7-2bee-4266-abd4-76809f3782dd
 
 symptom: >-
   sacct and sreport hang for minutes or time out. Running jobs are unaffected and
   new jobs still start. Users are complaining they cannot see their history.
 
 notes: >-
-  The control scenario for S01. Same family, same components, but the cause is
-  where the symptom is — one hop, not four. An agent should find this quickly.
-  Its real purpose is comparative: if a configuration scores similarly on S02 and
-  S01, the dependency graph is not what is helping it, because S02 does not need
-  one. Divergence between these two is the cleanest signal the benchmark produces.
+  The control scenario for S01. Same family, same components, and since the
+  2026-09 correction the same root-cause node: the fault is in the database in
+  both. What differs is the shape. In S01 the database answers nothing at all;
+  here it answers every query that does not touch the locked table, so an agent
+  can ask the database about its own sessions and see the lock. If a
+  configuration scores similarly on S02 and S01, the dependency graph is not
+  what is helping it, because S02 does not need one.
 
 injection: >-
-  A long-lived transaction holds a table lock on the job table
-  (SELECT ... FOR UPDATE with no commit), so accounting reads queue behind it
-  while the scheduling path, which does not touch that table synchronously,
-  continues normally.
+  A session connected as the accounting user (from the slurmdbd container, the
+  way the upstream entrypoint connects) takes `LOCK TABLES <cluster>_job_table
+  WRITE` on slurmdbd's job table (linux_job_table with the upstream
+  ClusterName=linux) and then sleeps, holding the lock. While a WRITE lock is
+  held no other session can read or write that table (MariaDB KB and MySQL
+  manual, LOCK TABLES), so slurmdbd's queries against it wait. This replaced
+  the original design (2026-09): a root login the image refuses, and
+  `SELECT ... FOR UPDATE`, which InnoDB consistent reads ignore
+  (https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html), so it
+  could not have made sacct wait even if the login had worked. The lock
+  request is bounded by MariaDB's `WAIT n`, the client's PID is recorded, and
+  both statements carry a marker, so the heal stops the client and kills its
+  session by id whether it is waiting for the lock or holding it. The old
+  heal's `pkill mariadb` also matched the database server. Not yet run on the
+  emulated cluster.
 
 observe_s: 240
+
+verification:
+  measured: false
+  caveats: >-
+    Design only. The first injection failed silently (see injection), so no
+    earlier run of this scenario could have observed anything. The rewritten
+    injection has not been run. The 30s delay for the slurmdbd hop is a design
+    estimate, not a measurement.
 
 causal_chain:
   - node: db.mysql
     state: table_lock_held
     observable_at_s: 0
     evidence:
-      - "mysql: INNODB_TRX shows a transaction running for minutes"
-      - "mysql: lock waits on the job table climbing"
+      - "the processlist (as the accounting user) shows one session holding a lock for minutes while slurmdbd's sessions wait on the job table"
+      - "the database answers queries that do not touch the job table"
 
   - node: slurm.slurmdbd
     state: queries_blocked
     observable_at_s: 30
     evidence:
-      - "slurmdbd log: query duration warnings"
-      - "sacct client blocks; slurmdbd thread count at limit"
+      - "sacct blocks without returning"
+      - "slurmdbd is running and accepts connections"
 
 scoring:
   - node: db.mysql
@@ -49,9 +73,9 @@ scoring:
   - node: storage.shared_fs
     credit: 0.0
     rationale: >-
-      Zero, not negative, but worth noting: an agent that has learned S01's
-      pattern may reach for storage reflexively. The filesystem is healthy here
-      and the telemetry says so.
+      Zero, not negative, but worth noting: an agent reaching for storage
+      beneath the database is reciting the folk model S01 was corrected away
+      from. Nothing shared sits beneath this cluster's database.
   - node: unknown
     credit: 0.05
     rationale: Honest abstention, small credit. This one is clearly solvable.

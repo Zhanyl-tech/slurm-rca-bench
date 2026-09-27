@@ -9,10 +9,14 @@ benchmark injects faults into.
     Licensed under the MIT License.
     Pinned at commit 978c3ded1f72c1855e528a56559a7a51142eb39c (Slurm 25.11.4).
 
-That project's source is NOT vendored into this repository. `make cluster`
-clones it at the pinned commit into vendor/, which is gitignored. The compose
-file under cluster/ is a derived, reduced configuration written for this
-benchmark; the images it references are built from the upstream Dockerfile.
+That project's source is NOT vendored into this repository. `make image`
+(cluster/build-image.sh) fetches it at the pinned commit into vendor/, which is
+gitignored, refuses to continue if the fetched SHA differs from the pin or the
+checkout has local changes, and builds the image from the upstream Dockerfile,
+tagged slurmrca/slurm-docker-cluster:25.11.4-978c3de and labelled with the
+pinned commit. An existing image with that tag is reused only when its label
+names the pinned commit. The compose file under cluster/ is a derived, reduced
+configuration written for this benchmark.
 
 All benchmark scenarios, ground truth, harness code, and scoring logic in this
 repository are original work.

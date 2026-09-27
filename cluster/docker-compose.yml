@@ -9,8 +9,16 @@
 # Runs under its own Compose project name (slurmrca) so injections can pause a
 # database or kill a node daemon without touching a developer's own cluster.
 
+# The tag is the one cluster/build-image.sh builds from upstream.lock:
+# <slurm version>-<first 7 characters of the pinned commit>. It used to be
+# slurm-docker-cluster:25.11.4, the name upstream's own compose file builds
+# from any commit, so a developer's upstream image was silently used instead.
+# tests/test_scripts.py fails if this line and the lock disagree. `never`
+# because the image exists only where build-image.sh built it: Compose must
+# fail rather than pull a same-named image from a registry.
 x-image: &slurm_image
-  image: slurm-docker-cluster:${SLURM_VERSION:-25.11.4}
+  image: slurmrca/slurm-docker-cluster:25.11.4-978c3de
+  pull_policy: never
 
 services:
   mysql:

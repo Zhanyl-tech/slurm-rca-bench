@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "slurmrca"
-version = "0.1.0"
-description = "The first public incident-diagnosis benchmark for HPC schedulers"
+version = "0.2.0"
+description = "Incident-diagnosis benchmark for the Slurm control plane, with ground truth marked measured or unverified"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -14,13 +14,28 @@ keywords = ["slurm", "hpc", "benchmark", "root-cause-analysis", "llm-agents", "s
 dependencies = ["pyyaml>=6.0", "click>=8.1"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "mypy>=1.8", "ruff>=0.5", "types-PyYAML"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.8",
+    "ruff>=0.5",
+    "types-PyYAML",
+    "shellcheck-py>=0.10",
+]
 
 [project.scripts]
 slurm-rca = "slurmrca.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/slurmrca"]
+
+# The scenarios and the compose file are the benchmark. The first wheel shipped
+# only the Python files, so an installed `slurm-rca list` had nothing to load.
+# loader.py finds these under slurmrca/_data before falling back to a source
+# checkout.
+[tool.hatch.build.targets.wheel.force-include]
+"scenarios" = "slurmrca/_data/scenarios"
+"cluster" = "slurmrca/_data/cluster"
 
 [tool.ruff]
 line-length = 100
@@ -31,7 +46,9 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PTH", "S"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+# Tests assert, and they deliberately run the container-side scripts with `sh`
+# and stub commands found on a test-controlled PATH.
+"tests/*" = ["S101", "S603", "S607"]
 
 [tool.mypy]
 # No python_version pin: the CI matrix runs each interpreter it claims to
@@ -39,7 +56,21 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C4", "PTH", "S"]
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
+# `mypy .` walks every directory, and `make wheel-check` leaves a virtualenv
+# in build/ and `make image` an upstream checkout in vendor/: neither is ours
+# to type-check. Bare `mypy` (CI, `make typecheck`) uses `files` and never
+# looked there; ruff skips build/ by default.
+exclude = ["^build/", "^vendor/"]
 
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers"
 testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["slurmrca"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

@@ -2,6 +2,22 @@ id: S07-fabric-degraded-collectives
 title: Multi-node jobs crawl, single-node jobs are fine
 family: fabric
 difficulty: single_layer
+status: blocked
+blocked_reason: >-
+  The injection cannot produce this ground truth on the current cluster. netem
+  is applied to the worker's only interface, which carries slurmd-slurmctld
+  control traffic, so a faithful reading of the evidence points at
+  network.control_plane (0.35), not fabric.interconnect (1.0). The compose file
+  runs one worker, so multi-node jobs and the single-node/multi-node split in
+  the ticket cannot exist, and nothing submits jobs. The pinned upstream image
+  installs no iproute-tc, so `tc` is probably absent (the inject now fails
+  loudly if so; not checked in a built image). Unblocking needs a dedicated
+  fabric network, at least two workers, netem on the fabric interface only, an
+  image overlay that installs iproute-tc, and a workload that runs one
+  single-node and one multi-node job. A run is not an unblocking condition: as
+  for every runnable scenario, it is what would later mark the chain measured.
+reported_node: gpu.device
+canary: 4eafe8c8-4be8-4fed-a35d-6b561118d18d
 
 symptom: >-
   Multi-node training jobs are taking three to four times longer than last week.
@@ -13,28 +29,31 @@ notes: >-
   application issue because the visible symptom is low GPU utilisation. The
   discriminator is the single-node/multi-node split: a slow GPU is slow
   everywhere, while a degraded fabric only hurts jobs that talk across nodes.
+  Blocked; kept so the design and the reason are visible.
 
 injection: >-
-  tc netem applied to the control-plane network adding latency and a small loss
-  rate between worker containers, so collectives retransmit. Emulates a failing
-  cable or congested switch port; it is network-layer emulation, not a real HCA
-  fault, and it cannot reproduce per-QP or per-HCA counter signatures.
+  tc netem (40ms ± 10ms delay, 3% loss) on the worker's eth0. As shipped this is
+  the control-plane network, not a data-plane fabric, which is why the scenario
+  is blocked. Since 2026-09 the inject fails loudly without tc, records the
+  interface's qdiscs first, and refuses to run over a root qdisc the heal could
+  not restore; the heal only removes a netem root qdisc it recorded adding. It
+  cannot reproduce per-QP or per-HCA counter signatures. Not yet run on the
+  emulated cluster.
 
 observe_s: 240
 
 verification:
   measured: false
   caveats: >-
-    Chain is designed, not yet observed. The scenario ships marked unverified
-    rather than being held back, so the suite composition is visible, but its
-    timings must not be quoted until measured. Phase 2b.
+    Chain is designed, not observed, and blocked (see blocked_reason). Its
+    timings must not be quoted.
 
 causal_chain:
   - node: fabric.interconnect
     state: degraded_retransmits
     observable_at_s: 0
     evidence:
-      - "IB/RoCE port counters: retransmit and out-of-sequence errors climbing"
+      - "IB/RoCE port counters: retransmit and out-of-sequence errors climbing (no source for these exists in the emulated cluster)"
       - "only jobs spanning more than one node are affected"
       - "GPU utilisation low and spiky on affected ranks — waiting, not computing"
 
@@ -58,8 +77,8 @@ scoring:
     rationale: The single-node/multi-node split is a clear discriminator.
 
 remediation_helpful:
-  - "identify and replace the degraded link or transceiver"
-  - "drain nodes attached to the affected switch port"
+  - "repair:fabric.interconnect"
+  - "drain:slurm.slurmd"
 
 distractors:
   gpu.device: >-
